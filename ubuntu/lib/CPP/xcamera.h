@@ -1,18 +1,18 @@
 #pragma once
-#ifndef __CAMERA_XCAMERA_H__
-#define __CAMERA_XCAMERA_H__
+#ifndef __XEMA_XCAMERA_H__
+#define __XEMA_XCAMERA_H__
 #include<vector>
 #include<string>
 
 extern "C" {
-    namespace CAMERA {
+    namespace XEMA {
 
         using namespace std;
 #ifdef _WIN32 
-#define CAMERA_API __declspec(dllexport)
+#define XEMA_API __declspec(dllexport)
 
 #elif __linux
-#define CAMERA_API 
+#define XEMA_API 
 #endif
 		  
   
@@ -28,14 +28,14 @@ extern "C" {
 
         }CalibrationParam;
 
-		enum class Engine
+		enum class XemaEngine
 		{
 			Normal = 0,
 			Reflect = 1,
 			Black = 2,
 		};
 
-		enum class Color
+		enum class XemaColor
 		{
 			Rgb = 0,
 			Bgr = 1,
@@ -57,38 +57,6 @@ extern "C" {
 			//返回值： 类型（int）:返回0表示连接成功;返回-1表示连接失败.
 			virtual int connect(const char* camera_id) = 0;
 			 
-
-			//函数名： DfGetParamJson
-			//功能： 获取Json配置文件
-			//输入参数：无
-			//输出参数： config_json（配置文件字符）、config_size（配置文本输出大小）、
-			//status_json（输出设置状态）、status_size（状态文本大小）
-			//返回值： 类型（int）:返回0表示设置参数成功;否则失败。
-			virtual int getParamJson(char* config_json, char* status_json) = 0;
-
-
-			//函数名： DfSaveJson
-			//功能： 保存Json配置文件
-			//输入参数：config_json（配置文件字符）
-			//输出参数： 无 
-			//返回值： 类型（int）:返回0表示设置参数成功;否则失败。
-			virtual int saveJson(const char* config_json, const char* path) = 0;
-
-
-			//函数名： DfReadJson
-			//功能： 读取Json配置文件
-			//输入参数：config_json（配置文件字符）、config_size（配置文本大小）、
-			//输出参数： 无 
-			//返回值： 类型（int）:返回0表示设置参数成功;否则失败。
-			virtual int readJson(char* config_json, const char* path) = 0;
-
-			//函数名： DfSetParamJson
-			//功能： 设置Json配置文件里的参数
-			//输入参数：config_json（输入配置文件字符）、config_size（输入文本出大小）
-			//输出参数：out_status_json（输出设置状态）、out_size（输出文本大小）、maxnum(填入采集captureData接口）
-			//返回值： 类型（int）:返回0表示设置参数成功;否则失败。
-			virtual int setParamJson(char* config_json, char* status_json, int& maxnum) = 0;
-
 			//功能： 获取相机分辨率
 			//输入参数： 无
 			//输出参数： width(图像宽)、height(图像高)
@@ -107,14 +75,14 @@ extern "C" {
 			//输入参数：engine
 			//输出参数：  
 			//返回值： 类型（int）:返回0表示设置参数成功;返回-1表示设置参数失败。
-			virtual int setCaptureEngine(Engine engine) = 0;
+			virtual int setCaptureEngine(XemaEngine engine) = 0;
 
 			//函数名： DfGetCaptureEngine
 			//功能： 设置采集引擎
 			//输入参数：
 			//输出参数：engine
 			//返回值： 类型（int）:返回0表示设置参数成功;返回-1表示设置参数失败。
-			virtual int getCaptureEngine(Engine& engine) = 0;
+			virtual int getCaptureEngine(XemaEngine& engine) = 0;
 			 
 			//功能： 采集一帧数据并阻塞至返回状态
 			//输入参数： exposure_num（曝光次数）：设置值为1为单曝光，大于1为多曝光模式（具体参数在相机gui中设置）.
@@ -157,14 +125,14 @@ extern "C" {
 			//输入参数：无
 			//输出参数： brightness(亮度图),color(亮度图颜色类型)
 			//返回值： 类型（int）:返回0表示获取数据成功;返回-1表示采集数据失败.
-			virtual int getColorBrightnessData(unsigned char* brightness, Color color) = 0;
+			virtual int getColorBrightnessData(unsigned char* brightness, XemaColor color) = 0;
 
 			//函数名： getUndistortColorBrightnessData
 			//功能： 获取去畸变后的彩色亮度图
 			//输入参数：无
 			//输出参数： brightness(亮度图)
 			//返回值： 类型（int）:返回0表示获取数据成功;返回-1表示采集数据失败.
-			virtual int getUndistortColorBrightnessData(unsigned char* brightness, Color color) = 0;
+			virtual int getUndistortColorBrightnessData(unsigned char* brightness, XemaColor color) = 0;
 			 
 			//功能： 获取校正到基准平面的高度映射图
 			//输入参数：无  
@@ -403,18 +371,6 @@ extern "C" {
 			//返回值： 类型（int）:返回0表示设置参数成功;否则失败。
 			virtual int getParamBrightnessGain(float& gain) = 0;
 
-			//功能： 获取多曝光模式
-			//输入参数： model(1：HDR(默认值)、2：重复曝光)
-			//输出参数：无
-			//返回值： 类型（int）:返回0表示设置参数成功;否则失败。
-			virtual  int getParamMultipleExposureModel(int& model) = 0;
-
-			//功能： 获取重复曝光数
-			//输入参数： num(2-10)
-			//输出参数：无
-			//返回值： 类型（int）:返回0表示设置参数成功;否则失败。
-			virtual  int getParamRepetitionExposureNum(int& num) = 0;
-
 			//函数名： getSdkVersion
 			//功能： 获取sdk版本
 			//输入参数：无
@@ -434,7 +390,7 @@ extern "C" {
 			//输入参数： color(图像颜色类型)
 			//输出参数： brightness(亮度图)
 			//返回值： 类型（int）:返回0表示获取数据成功;返回-1表示采集数据失败.
-			virtual int captureBrightnessData(unsigned char* brightness, Color color) = 0;
+			virtual int captureBrightnessData(unsigned char* brightness, XemaColor color) = 0;
 
 			//函数名： setParamReflectFilter
 			//功能： 设置亮度图增益
@@ -449,24 +405,10 @@ extern "C" {
 			//输出参数：use(开关：1开、0关)、param_b（过滤系数：范围0-100）
 			//返回值： 类型（int）:返回0表示设置参数成功;否则失败。
 			virtual int getParamReflectFilter(int& use, float& param_b) = 0;
-
-			//函数名： savePointcloudToPcd
-			//功能： 保存pcd点云
-			//输入参数：pointcloud(点云)、brightness（亮度图）、channels（亮度图通道数）、path(路径)
-			//输出参数：gain(亮度图增益)
-			//返回值： 类型（int）:返回0表示设置参数成功;否则失败。
-			virtual int savePointcloudToPcd(float* pointcloud, unsigned char* brightness, int channels, const char* path) = 0;
-
-			//函数名： savePointcloudToPly
-			//功能： 保存ply点云
-			//输入参数：pointcloud(点云)、brightness（亮度图）、channels（亮度图通道数）、path(路径)
-			//输出参数：gain(亮度图增益)
-			//返回值： 类型（int）:返回0表示设置参数成功;否则失败。
-			virtual int savePointcloudToPly(float* pointcloud, unsigned char* brightness, int channels, const char* path) = 0;
         };
 
-        CAMERA_API void* createXCamera();
-        CAMERA_API void destroyXCamera(void*);
+        XEMA_API void* createXCamera();
+        XEMA_API void destroyXCamera(void*);
 
     }
 }

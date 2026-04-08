@@ -29,14 +29,14 @@ extern "C"
 
 	};
 
-	enum class Engine
+	enum class XemaEngine
 	{
 		Normal = 0,
 		Reflect = 1,
 	};
 
 
-	enum class Color
+	enum class XemaColor
 	{
 		Rgb = 0,
 		Bgr = 1,
@@ -69,14 +69,14 @@ extern "C"
 	//输入参数：engine
 	//输出参数：  
 	//返回值： 类型（int）:返回0表示设置参数成功;返回-1表示设置参数失败。
-	DF_SDK_API int DfSetCaptureEngine(Engine engine);
+	DF_SDK_API int DfSetCaptureEngine(XemaEngine engine);
 
 	//函数名： DfGetCaptureEngine
 	//功能： 获取采集引擎模式
 	//输入参数：
 	//输出参数：engine
 	//返回值： 类型（int）:返回0表示设置参数成功;返回-1表示设置参数失败。
-	DF_SDK_API int DfGetCaptureEngine(Engine& engine);
+	DF_SDK_API int DfGetCaptureEngine(XemaEngine& engine);
 
 	//函数名： DfCaptureData
 	//功能： 采集一帧数据并阻塞至返回状态
@@ -118,14 +118,14 @@ extern "C"
 	//输入参数：无
 	//输出参数： brightness(亮度图),color(亮度图颜色类型)
 	//返回值： 类型（int）:返回0表示获取数据成功;返回-1表示采集数据失败.
-	DF_SDK_API int DfGetColorBrightnessData(unsigned char* brightness, Color color);
+	DF_SDK_API int DfGetColorBrightnessData(unsigned char* brightness, XemaColor color);
 
 	//函数名： DfGetUndistortColorBrightnessData
 	//功能： 获取去畸变后的彩色亮度图
 	//输入参数：无
 	//输出参数： brightness(亮度图)
 	//返回值： 类型（int）:返回0表示获取数据成功;返回-1表示采集数据失败.
-	DF_SDK_API int DfGetUndistortColorBrightnessData(unsigned char* brightness, Color color);
+	DF_SDK_API int DfGetUndistortColorBrightnessData(unsigned char* brightness, XemaColor color);
 
 	//函数名： DfGetUndistortBrightnessData
 	//功能： 获取去畸变后的亮度图
@@ -443,7 +443,7 @@ extern "C"
 	//输入参数：color(图像颜色类型)
 	//输出参数： brightness(亮度图)
 	//返回值： 类型（int）:返回0表示获取数据成功;返回-1表示采集数据失败.
-	DF_SDK_API int DfCaptureBrightnessData(unsigned char* brightness, Color color);
+	DF_SDK_API int DfCaptureBrightnessData(unsigned char* brightness, XemaColor color);
 
 	//函数名： DfSetParamReflectFilter
 	//功能： 设置亮度图增益
