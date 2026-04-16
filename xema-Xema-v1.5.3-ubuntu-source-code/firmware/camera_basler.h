@@ -1,0 +1,61 @@
+#pragma once
+#include <stdlib.h>
+#include <stdio.h>
+#include <malloc.h>
+
+#include <pylonc/PylonC.h>
+#include "camera.h"
+#include <chrono>         // std::chrono::milliseconds
+#include <thread>         // std::thread
+#include <mutex>          // std::timed_mutex
+
+
+#define NUM_BUFFERS 5         /* Number of buffers used for grabbing. */
+
+class CameraBasler: public Camera
+{
+public:
+	CameraBasler();
+	~CameraBasler();
+
+	bool openCamera(); 
+	bool closeCamera(); 
+
+	bool switchToInternalTriggerMode(); 
+	bool switchToExternalTriggerMode();
+
+	bool getExposure(double &val); 
+	bool setExposure(double val); 
+
+	bool getGain(double &value);
+	bool setGain(double value);  
+
+    bool streamOn(); 
+	bool streamOff();
+ 
+    bool trigger_software();
+	
+    bool grap(unsigned char* buf);
+
+    bool grap(unsigned short* buf);
+
+	
+	bool setPixelFormat(int val);
+	
+	bool getPixelFormat(int &val);
+private:
+	void streamOffThread();
+private:
+
+    unsigned char*              buffers_[NUM_BUFFERS];     /* Buffers used for grabbing. */
+    PYLON_STREAMBUFFER_HANDLE   bufHandles_[NUM_BUFFERS];  /* Handles for the buffers. */
+   
+    PYLON_DEVICE_HANDLE         hDev_;                     /* Handle for the pylon device. */
+    PYLON_STREAMGRABBER_HANDLE  hGrabber_;                 /* Handle for the pylon stream grabber. */
+    PYLON_WAITOBJECT_HANDLE     hWait_;                    /* Handle used for waiting for a grab to be finished. */
+ 
+	std::mutex operate_mutex_;
+
+	int pixel_bit_= 8;
+	int payloadSize_;
+};
