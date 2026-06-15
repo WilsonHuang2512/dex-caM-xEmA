@@ -1,0 +1,345 @@
+C51 COMPILER V9.52.0.0   MAIN                                                              04/02/2024 10:10:07 PAGE 1   
+
+
+C51 COMPILER V9.52.0.0, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN .\Output\main.obj
+COMPILER INVOKED BY: D:\Keil_v4\C51\BIN\C51.EXE Code\main.c BROWSE INCDIR(..\Include) DEFINE(FOSC_160000) DEBUG OBJECTEX
+                    -TEND PRINT(.\LST\main.lst) TABS(2) OBJECT(.\Output\main.obj)
+
+line level    source
+
+   1          #include "N76E003.h"
+   2          #include "Common.h"
+   3          #include "Delay.h"
+   4          #include "SFR_Macro.h"
+   5          #include "Function_define.h"
+   6          #include <string.h>
+   7          
+   8          
+   9          #define MCU_VERSION               "V1.0"
+  10          
+  11          #define PROJECTOR_ON              V15V_PWR_ON
+  12          #define PROJECTOR_OFF             V15V_PWR_OFF
+  13          
+  14          #define BOARD_ON                  CORE_PWR_ON
+  15          #define BOARD_OFF                 CORE_PWR_OFF
+  16          
+  17          #define I2C_SLAVE_ADDR            (0x2C<<1)
+  18          #define I2C_IDLE                  0xf8
+  19          #define I2C_BYTE_CMD              0
+  20          
+  21          #define I2C_CMD_RESET_PROJECTOR   0xE0
+  22          #define I2C_CMD_RESET_NANO        0xE1
+  23          
+  24          
+  25          #define I2C_CMD_GET_VERSION       0xF0
+  26          #define I2C_CMD_GET_TEMPERATURE   0xF1
+  27          
+  28          #define I2C_RX_LEN                32
+  29          #define I2C_TX_LEN                32
+  30          
+  31          UINT8        rxdata[I2C_RX_LEN];
+  32          UINT8        rxcnt=0;
+  33          
+  34          UINT8        txdata[I2C_TX_LEN];
+  35          UINT8        txcnt=0;
+  36          
+  37          
+  38          
+  39          unsigned int adcvalue=0;
+  40          
+  41          //========================================================================================================
+  42          void mymemset(UINT8 *dst, UINT8 val, UINT8 len)
+  43          {
+  44   1        UINT8 i;
+  45   1      
+  46   1        for(i=0; i<len; i++)
+  47   1          {
+  48   2            *dst++=val;
+  49   2          }
+  50   1      }
+  51          
+  52          
+  53          //========================================================================================================
+  54          void Rx_Reset()
+C51 COMPILER V9.52.0.0   MAIN                                                              04/02/2024 10:10:07 PAGE 2   
+
+  55          {
+  56   1        mymemset(rxdata, 0, I2C_RX_LEN);
+  57   1        rxcnt=0;
+  58   1      }
+  59          
+  60          //========================================================================================================
+  61          void Tx_SetData(char *buf, char len)
+  62          {
+  63   1        int i;
+  64   1      
+  65   1        txcnt=0;
+  66   1        if(len>I2C_TX_LEN)
+  67   1          {
+  68   2            len=I2C_TX_LEN;
+  69   2          }
+  70   1        for(i=0; i<len; i++)
+  71   1          {
+  72   2            txdata[i]=*buf++;
+  73   2          }
+  74   1        for(; i<I2C_TX_LEN; i++)
+  75   1          {
+  76   2            txdata[i]=0;
+  77   2          }
+  78   1      }
+  79          
+  80          /*********************************************************************************************************
+             -***
+  81          *    I2C interrupt sub-routine
+  82          **********************************************************************************************************
+             -**/
+  83          void I2C_ISR(void) interrupt 6
+  84          {
+  85   1        switch(I2STAT)
+  86   1          {
+  87   2            case 0x00 :
+  88   2              STO=1;
+  89   2              break;
+  90   2      
+  91   2            case 0x60 :
+  92   2              AA=1;
+  93   2              break;
+  94   2      
+  95   2            case 0x68 :
+  96   2              AA=0;
+  97   2              STA=1;
+  98   2              break;
+  99   2      
+ 100   2            case 0x80 :
+ 101   2              rxdata[rxcnt]=I2DAT;
+ 102   2              switch(rxdata[rxcnt])
+ 103   2                {
+ 104   3                  case I2C_CMD_GET_VERSION :
+ 105   3                    Tx_SetData((char *)MCU_VERSION, strlen(MCU_VERSION));
+ 106   3                    break;
+ 107   3                  case I2C_CMD_GET_TEMPERATURE :
+ 108   3                    Tx_SetData((char *)&adcvalue, sizeof(adcvalue));
+ 109   3                    break;
+ 110   3                  default :
+ 111   3                    break;
+ 112   3                }
+ 113   2      
+ 114   2              rxcnt++;
+C51 COMPILER V9.52.0.0   MAIN                                                              04/02/2024 10:10:07 PAGE 3   
+
+ 115   2      
+ 116   2              if(rxcnt==I2C_RX_LEN)
+ 117   2                {
+ 118   3                  AA=0;
+ 119   3                }
+ 120   2              else
+ 121   2                {
+ 122   3                  AA=1;
+ 123   3                }
+ 124   2              break;
+ 125   2      
+ 126   2            case 0x88 :
+ 127   2              rxdata[rxcnt]=I2DAT;
+ 128   2              rxcnt=0;
+ 129   2              AA=1;
+ 130   2              break;
+ 131   2      
+ 132   2            case 0xA0 :
+ 133   2              AA=1;
+ 134   2              break;
+ 135   2      
+ 136   2            case 0xA8 :
+ 137   2              txcnt=0;
+ 138   2              I2DAT=txdata[txcnt++];
+ 139   2              AA=1;
+ 140   2              break;
+ 141   2      
+ 142   2            case 0xB8 :
+ 143   2              I2DAT=txdata[txcnt++];
+ 144   2              if(txcnt==I2C_RX_LEN)
+ 145   2                {
+ 146   3                  AA=0;
+ 147   3                }
+ 148   2              else
+ 149   2                {
+ 150   3                  AA=1;
+ 151   3                }
+ 152   2              break;
+ 153   2      
+ 154   2            case 0xC0 :
+ 155   2              AA=1;
+ 156   2              break;
+ 157   2      
+ 158   2            case 0xC8 :
+ 159   2              AA=1;
+ 160   2              break;
+ 161   2          }
+ 162   1      
+ 163   1        SI=0;
+ 164   1        while(STO)
+ 165   1          {
+ 166   2            ;
+ 167   2          }
+ 168   1      }
+ 169          /*********************************************************************************************************
+             -***
+ 170          *    WDT interrupt sub-routine
+ 171          **********************************************************************************************************
+             -**/
+ 172          void WDT_ISR(void)   interrupt 10
+ 173          {
+ 174   1        clr_WDTF;
+C51 COMPILER V9.52.0.0   MAIN                                                              04/02/2024 10:10:07 PAGE 4   
+
+ 175   1        set_WDCLR;
+ 176   1      }
+ 177          
+ 178          //========================================================================================================
+ 179          void Init_I2C()
+ 180          {
+ 181   1        P13_Quasi_Mode;                           //set SCL (P13) is Quasi mode
+ 182   1        P14_Quasi_Mode;                           //set SDA (P14) is Quasi mode
+ 183   1      
+ 184   1        SDA=1;                                    //set SDA and SCL pins high
+ 185   1        SCL=1;
+ 186   1      
+ 187   1        set_P0SR_6;                               //set SCL (P06) is  Schmitt triggered input select.
+ 188   1      
+ 189   1        set_EI2C;                                 //enable I2C interrupt by setting IE1 bit 0
+ 190   1      
+ 191   1        I2ADDR=I2C_SLAVE_ADDR;                    //define own slave address
+ 192   1        set_I2CEN;                                //enable I2C circuit
+ 193   1        set_AA;
+ 194   1      }
+ 195          
+ 196          //========================================================================================================
+ 197          void Init_IO()
+ 198          {
+ 199   1        Set_All_GPIO_Quasi_Mode;
+ 200   1        P03_PushPull_Mode;
+ 201   1        P04_PushPull_Mode;
+ 202   1        P00_PushPull_Mode;
+ 203   1        P01_PushPull_Mode;
+ 204   1        P15_Input_Mode;
+ 205   1      }
+ 206          
+ 207          //========================================================================================================
+ 208          void Init_WDT()
+ 209          {
+ 210   1        TA=0xAA; TA=0x55; WDCON=0x06;     // Setting WDT prescale
+ 211   1        set_WDTR;                         // WDT run
+ 212   1        set_WDCLR;                        // Clear WDT timer
+ 213   1        set_EWDT;
+ 214   1      }
+ 215          
+ 216          
+ 217          
+ 218          //========================================================================================================
+ 219          
+ 220          
+ 221          void  delay(int t)
+ 222          {
+ 223   1        int i, j;
+ 224   1      
+ 225   1        for(i=0; i<t; i++)
+ 226   1          {
+ 227   2            for(j=0; j<1000; j++)
+ 228   2              {
+ 229   3              }
+ 230   2          }
+ 231   1      }
+ 232          
+ 233          
+ 234          
+ 235          void InitialAdc(void)
+ 236          {
+C51 COMPILER V9.52.0.0   MAIN                                                              04/02/2024 10:10:07 PAGE 5   
+
+ 237   1        P05_Quasi_Mode;
+ 238   1        Enable_ADC_AIN4;
+ 239   1        clr_ADCF;
+ 240   1        set_ADCS;
+ 241   1      }
+ 242          
+ 243          void GetTemperature(void)
+ 244          {
+ 245   1        if(ADCF)
+ 246   1          {
+ 247   2            adcvalue=ADCRH;
+ 248   2            adcvalue<<=4;
+ 249   2            adcvalue|=(ADCRL&0x0f);
+ 250   2            clr_ADCF;
+ 251   2            set_ADCS;
+ 252   2          }
+ 253   1      }
+ 254          
+ 255          void main(void)
+ 256          {
+ 257   1        int i;
+ 258   1      
+ 259   1        Init_IO();
+ 260   1        CORE_PWR_OFF;
+ 261   1        V15V_PWR_OFF;
+ 262   1        LASER_PWR_OFF;
+ 263   1        VIBRATION_PWR_OFF;
+ 264   1        CORE_PWR_ON;
+ 265   1        for(i=0; i<5; i++)
+ 266   1          {
+ 267   2            delay(1000);
+ 268   2          }
+ 269   1      
+ 270   1        V15V_PWR_ON;
+ 271   1        VIBRATION_PWR_ON;
+ 272   1        LASER_PWR_ON;
+ 273   1        Init_I2C();
+ 274   1        Init_WDT();
+ 275   1        InitialAdc();
+ 276   1        set_EA;
+ 277   1      
+ 278   1        while(1)
+ 279   1          {
+ 280   2            if(I2STAT==I2C_IDLE)
+ 281   2              {
+ 282   3                switch(rxdata[I2C_BYTE_CMD])
+ 283   3                  {
+ 284   4                    case I2C_CMD_RESET_PROJECTOR :
+ 285   4                      PROJECTOR_OFF;
+ 286   4                      Rx_Reset();
+ 287   4                      Timer0_Delay1ms(5000);
+ 288   4                      PROJECTOR_ON;
+ 289   4                      break;
+ 290   4      
+ 291   4                    case I2C_CMD_RESET_NANO :
+ 292   4                      BOARD_OFF;
+ 293   4                      Rx_Reset();
+ 294   4                      Timer0_Delay1ms(5000);
+ 295   4                      BOARD_ON;
+ 296   4                      break;
+ 297   4      
+ 298   4                    default :
+C51 COMPILER V9.52.0.0   MAIN                                                              04/02/2024 10:10:07 PAGE 6   
+
+ 299   4                      Rx_Reset();
+ 300   4                      break;
+ 301   4                  }
+ 302   3              }
+ 303   2            GetTemperature();
+ 304   2            Timer0_Delay1ms(100);
+ 305   2          }
+ 306   1      }
+ 307          
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =    829    ----
+   CONSTANT SIZE    =      5    ----
+   XDATA SIZE       =   ----    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =     68       9
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

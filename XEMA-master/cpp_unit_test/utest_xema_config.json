@@ -1,0 +1,16 @@
+{
+  "repeat_count": 1,
+  "log_path": "./logs",
+  "camera_ip": "",
+  "confidence": 10,
+  "gain": 0.0,
+  "smoothing": 1,
+  "led_current": 1023,
+  "exposure": 30000.0,
+  "brightness_exposure": 36000.0,
+  "brightness_gain": 10.0,
+  "brightness_exposure_model": 1,
+  "multi_exposure_num": 2,
+  "multi_led_params": [100, 1023, 1023, 1023, 1023, 1023],
+  "multi_exposure_params": [6000, 30000, 60000, 60000, 60000, 60000]
+}
