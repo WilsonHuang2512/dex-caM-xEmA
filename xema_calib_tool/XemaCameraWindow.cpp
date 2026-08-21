@@ -6,22 +6,49 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QFile>
+#include <QDir>
+#include <QFileDialog>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDateTime>
+#include <QFontMetrics>
 #include <thread>
 #include <cmath>
 #include <QElapsedTimer>
 #include <QAbstractButton>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
-#include <opencv2/features2d.hpp>
-#include <opencv2/calib3d.hpp>
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <cwchar>
+#endif
+
+// Same Win98-style theme as the earlier scan tool, so the two tools look/feel consistent.
+static const char* kWin98Style =
+	"QWidget { background-color: #c0c0c0; color: #000000; font-family: 'Tahoma','MS Sans Serif','Segoe UI'; font-size: 9pt; }"
+	"QPushButton { background-color: #c0c0c0; border-style: outset; border-width: 2px;"
+	"  border-color: #ffffff #808080 #808080 #ffffff; padding: 4px 10px; }"
+	"QPushButton:pressed { border-style: inset; border-color: #808080 #ffffff #ffffff #808080; }"
+	"QPushButton:disabled { color: #808080; }"
+	"QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {"
+	"  background-color: #ffffff; border-style: inset; border-width: 2px;"
+	"  border-color: #808080 #ffffff #ffffff #808080; padding: 2px; }"
+	"QGroupBox { border: 2px groove #808080; margin-top: 10px; padding-top: 6px; font-weight: bold; }"
+	"QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }";
+
+static const char* kTerminalLogStyle =
+	"background-color: #000000; color: #33ff66; border-style: inset; border-width: 2px;"
+	"border-color: #808080 #ffffff #ffffff #808080; padding: 3px 6px;"
+	"font-family: 'Consolas','Lucida Console',monospace; font-size: 9pt;";
 
 XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	: QWidget(parent)
 {
+	initStatusConsole();
+
 	setWindowTitle(u8"XEMA 相机控制");
+	setStyleSheet(kWin98Style);
 	resize(700, 700);
 
 	// ---- connection row ----
@@ -39,14 +66,28 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	connect_row->addWidget(btn_disconnect_);
 	connect_row->addWidget(label_firmware_);
 
+	edit_identity_ = new QLineEdit(this);
+	edit_identity_->setPlaceholderText(u8"标识，如 MAC 地址或设备名称");
+	edit_save_path_ = new QLineEdit(this);
+	edit_save_path_->setPlaceholderText(u8"图像保存根目录（留空则使用程序所在目录）");
+	btn_browse_save_path_ = new QPushButton(u8"浏览...", this);
+
+	QHBoxLayout* identity_row = new QHBoxLayout();
+	identity_row->addWidget(new QLabel(u8"标识:", this));
+	identity_row->addWidget(edit_identity_);
+	identity_row->addWidget(new QLabel(u8"保存路径:", this));
+	identity_row->addWidget(edit_save_path_);
+	identity_row->addWidget(btn_browse_save_path_);
+
 	// ---- params ----
 	spin_led_ = new QSpinBox(this);
 	spin_led_->setRange(0, 1023);
+	spin_led_->setSingleStep(100); // up/down arrows step by 100
 	spin_led_->setValue(1023);
 
 	spin_gain_ = new QDoubleSpinBox(this);
 	spin_gain_->setRange(0.0, 24.0); // matches the real GUI's doubleSpinBox_gain range
-	spin_gain_->setSingleStep(0.1);
+	spin_gain_->setSingleStep(1.0); // up/down arrows step by 1
 	spin_gain_->setValue(0.0);
 
 	spin_exposure_ = new QDoubleSpinBox(this);
@@ -56,6 +97,7 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	// applyExposureRangeForProjector() narrows it to the real bounds then.
 	spin_exposure_->setRange(1700.0, 100000.0);
 	spin_exposure_->setDecimals(0);
+	spin_exposure_->setSingleStep(1000.0); // up/down arrows step by 1000
 	spin_exposure_->setValue(30000.0);
 
 	btn_apply_params_ = new QPushButton(u8"应用参数", this);
@@ -71,24 +113,7 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	param_row->addWidget(spin_exposure_);
 	param_row->addWidget(btn_apply_params_);
 
-	// ---- capture engine ----
-	// XemaEngine::Normal/Reflect/Black -- DfCaptureData uses a genuinely different
-	// reconstruction path per engine (see header comment). Defaulting the UI to Normal here
-	// rather than the SDK's raw Reflect default is a starting guess for testing against
-	// whatever the real vendor GUI is actually using -- switch this and re-test board
-	// recognition if Normal doesn't match.
-	combo_engine_ = new QComboBox(this);
-	combo_engine_->addItem(u8"普通 (Normal)");
-	combo_engine_->addItem(u8"反光 (Reflect)");
-	combo_engine_->addItem(u8"黑白 (Black)");
-	combo_engine_->setCurrentIndex(0);
-
-	QHBoxLayout* engine_row = new QHBoxLayout();
-	engine_row->addWidget(new QLabel(u8"采集引擎:", this));
-	engine_row->addWidget(combo_engine_);
-	engine_row->addStretch();
-
-	// ---- board spacing ----
+	// ---- board spacing (still needed as calibration.exe's --board argument) ----
 	group_board_spacing_ = new QButtonGroup(this);
 	radio_spacing_4_ = new QRadioButton("4mm", this);
 	radio_spacing_12_ = new QRadioButton("12mm", this);
@@ -113,36 +138,51 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	// ---- capture ----
 	btn_capture_ = new QPushButton(u8"开始连续采集", this);
 	btn_capture_->setEnabled(false);
-	btn_save_frame_ = new QPushButton(u8"保存当前帧", this);
-	btn_save_frame_->setEnabled(false);
-	btn_save_frame_->setToolTip(u8"保存最近一次采集的原始亮度图（未叠加过曝/标定板标记），用于检查图像本身");
-	label_overexposure_ = new QLabel(u8"过曝: -", this);
-	label_board_ = new QLabel(u8"标定板: -", this);
+	btn_capture_calib_ = new QPushButton(u8"拍照（用于标定）", this);
+	btn_capture_calib_->setEnabled(false);
+	btn_capture_calib_->setToolTip(u8"停止连续采集（如果正在运行），拍摄一张单独的标定用图像并保存编号");
 
 	QHBoxLayout* capture_row = new QHBoxLayout();
 	capture_row->addWidget(btn_capture_);
-	capture_row->addWidget(btn_save_frame_);
-	capture_row->addWidget(label_overexposure_);
-	capture_row->addWidget(label_board_);
+	capture_row->addWidget(btn_capture_calib_);
+
+	// ---- calibrate ----
+	btn_calibrate_ = new QPushButton(u8"标定", this);
+	btn_calibrate_->setEnabled(true); // no camera connection needed
+	btn_calibrate_->setToolTip(u8"对已拍摄的标定姿态运行 calibration.exe，不需要相机连接");
+	label_calib_status_ = new QLabel(u8"标定: -", this);
+
+	btn_write_params_ = new QPushButton(u8"写参数", this);
+	btn_write_params_->setEnabled(false); // needs a live connection, like capture-for-calib
+	btn_write_params_->setToolTip(u8"将标定结果 (param.txt) 写入相机 -- 需要先成功运行标定");
+	label_write_status_ = new QLabel(u8"写参数: -", this);
+
+	QHBoxLayout* calibrate_row = new QHBoxLayout();
+	calibrate_row->addWidget(btn_calibrate_);
+	calibrate_row->addWidget(label_calib_status_);
+	calibrate_row->addWidget(btn_write_params_);
+	calibrate_row->addWidget(label_write_status_);
+	calibrate_row->addStretch();
 
 	label_image_ = new QLabel(this);
 	label_image_->setMinimumHeight(350);
 	label_image_->setAlignment(Qt::AlignCenter);
-	label_image_->setStyleSheet("background-color:#222; border: 1px solid #888;");
 	label_image_->setText(u8"（未连接）");
 	label_image_->setStyleSheet("background-color:#222; color:#aaa; border: 1px solid #888;");
 
 	// ---- log ----
-	log_view_ = new QTextEdit(this);
-	log_view_->setReadOnly(true);
-	log_view_->setFixedHeight(140);
+	log_view_ = new QLabel(this);
+	log_view_->setFixedHeight(26);
+	log_view_->setStyleSheet(kTerminalLogStyle);
+	log_view_->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
 	QVBoxLayout* main_layout = new QVBoxLayout(this);
 	main_layout->addLayout(connect_row);
+	main_layout->addLayout(identity_row);
 	main_layout->addWidget(param_box);
-	main_layout->addLayout(engine_row);
 	main_layout->addWidget(board_box);
 	main_layout->addLayout(capture_row);
+	main_layout->addLayout(calibrate_row);
 	main_layout->addWidget(label_image_, 1);
 	main_layout->addWidget(log_view_);
 
@@ -150,13 +190,19 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	connect(btn_disconnect_, &QPushButton::clicked, this, &XemaCameraWindow::onDisconnectClicked);
 	connect(btn_apply_params_, &QPushButton::clicked, this, &XemaCameraWindow::onApplyParamsClicked);
 	connect(btn_capture_, &QPushButton::clicked, this, &XemaCameraWindow::onCaptureToggled);
-	connect(btn_save_frame_, &QPushButton::clicked, this, &XemaCameraWindow::onSaveFrameClicked);
+	connect(btn_capture_calib_, &QPushButton::clicked, this, &XemaCameraWindow::onCaptureForCalibClicked);
+	connect(btn_calibrate_, &QPushButton::clicked, this, &XemaCameraWindow::onCalibrateClicked);
+	connect(btn_write_params_, &QPushButton::clicked, this, &XemaCameraWindow::onWriteParamsClicked);
+	connect(btn_browse_save_path_, &QPushButton::clicked, this, &XemaCameraWindow::onBrowseSavePathClicked);
 	connect(group_board_spacing_, QOverload<QAbstractButton*>::of(&QButtonGroup::buttonClicked), this, &XemaCameraWindow::onBoardSpacingChanged);
-	connect(combo_engine_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &XemaCameraWindow::onCaptureEngineChanged);
 	connect(this, &XemaCameraWindow::connectFinished, this, &XemaCameraWindow::onConnectFinished);
 	connect(this, &XemaCameraWindow::captureFinished, this, &XemaCameraWindow::onCaptureFinished);
 	connect(this, &XemaCameraWindow::applyParamsFinished, this, &XemaCameraWindow::onApplyParamsFinished);
 	connect(this, &XemaCameraWindow::disconnectFinished, this, &XemaCameraWindow::onDisconnectFinished);
+	connect(this, &XemaCameraWindow::calibCaptureFinished, this, &XemaCameraWindow::onCalibCaptureFinished);
+	connect(this, &XemaCameraWindow::calibrateFinished, this, &XemaCameraWindow::onCalibrateFinished);
+	connect(this, &XemaCameraWindow::writeParamsFinished, this, &XemaCameraWindow::onWriteParamsFinished);
+	connect(&busy_heartbeat_timer_, &QTimer::timeout, this, &XemaCameraWindow::onBusyHeartbeat);
 
 	loadConfig();
 	log(u8"就绪。");
@@ -177,7 +223,18 @@ XemaCameraWindow::~XemaCameraWindow()
 	{
 		DfDisconnect(edit_ip_->text().trimmed().toStdString().c_str());
 	}
+
+#ifdef _WIN32
+	if (console_handle_)
+	{
+		CloseHandle((HANDLE)console_handle_);
+		console_handle_ = nullptr;
+	}
+	FreeConsole();
+#endif
 }
+
+// ==================== config ====================
 
 void XemaCameraWindow::loadConfig()
 {
@@ -196,6 +253,8 @@ void XemaCameraWindow::loadConfig()
 	if (obj.contains("led")) spin_led_->setValue(obj.value("led").toInt(spin_led_->value()));
 	if (obj.contains("gain")) spin_gain_->setValue(obj.value("gain").toDouble(spin_gain_->value()));
 	if (obj.contains("exposure")) spin_exposure_->setValue(obj.value("exposure").toDouble(spin_exposure_->value()));
+	if (obj.contains("identity")) edit_identity_->setText(obj.value("identity").toString());
+	if (obj.contains("save_path")) edit_save_path_->setText(obj.value("save_path").toString());
 
 	int spacing = obj.value("board_spacing_mm").toInt(80);
 	switch (spacing)
@@ -205,13 +264,6 @@ void XemaCameraWindow::loadConfig()
 	case 20: radio_spacing_20_->setChecked(true); board_spacing_ = XemaBoardSpacingMm::Spacing20; break;
 	case 40: radio_spacing_40_->setChecked(true); board_spacing_ = XemaBoardSpacingMm::Spacing40; break;
 	default: radio_spacing_80_->setChecked(true); board_spacing_ = XemaBoardSpacingMm::Spacing80; break;
-	}
-
-	int engine = obj.value("capture_engine").toInt((int)XemaEngine::Normal);
-	if (engine >= 0 && engine <= 2)
-	{
-		capture_engine_ = engine;
-		combo_engine_->setCurrentIndex(engine);
 	}
 }
 
@@ -224,7 +276,8 @@ void XemaCameraWindow::saveConfig()
 	obj["gain"] = spin_gain_->value();
 	obj["exposure"] = spin_exposure_->value();
 	obj["board_spacing_mm"] = (int)board_spacing_;
-	obj["capture_engine"] = capture_engine_;
+	obj["identity"] = edit_identity_->text();
+	obj["save_path"] = edit_save_path_->text();
 
 	QFile f(path);
 	if (f.open(QIODevice::WriteOnly))
@@ -246,28 +299,181 @@ void XemaCameraWindow::onBoardSpacingChanged()
 	saveConfig();
 }
 
-void XemaCameraWindow::onCaptureEngineChanged(int index)
+void XemaCameraWindow::onBrowseSavePathClicked()
 {
-	if (index < 0 || index > 2) return;
-
-	capture_engine_ = index;
-	saveConfig();
-
-	if (!connected_) return;
-
-	// DfSetCaptureEngine is a plain local variable set inside the SDK (no network call, no
-	// mutex) -- safe to call directly here even mid-capture, unlike DfSetParamCameraExposure/
-	// DfSetParamCameraGain which needed the stop/resume dance in applyParamsThreadFunc.
-	XemaEngine engine = (XemaEngine)index;
-	int ret = DfSetCaptureEngine(engine);
-	const char* names[3] = { u8"普通(Normal)", u8"反光(Reflect)", u8"黑白(Black)" };
-	log(QString(u8"采集引擎切换为: %1  (返回码 %2)").arg(names[index]).arg(ret));
+	QString dir = QFileDialog::getExistingDirectory(this, u8"选择图像保存根目录", edit_save_path_->text());
+	if (!dir.isEmpty())
+	{
+		edit_save_path_->setText(QDir::toNativeSeparators(dir));
+		saveConfig();
+	}
 }
 
+QString XemaCameraWindow::identityFolderName() const
+{
+	QString id = edit_identity_->text().trimmed();
+	id.replace(":", "_");
+	id.replace("-", "_");
+	id.replace(" ", "_");
+	if (id.isEmpty())
+	{
+		id = "default"; // still need *some* folder name if the identity field is left blank
+	}
+	return id;
+}
+
+QString XemaCameraWindow::currentIdentityFolder() const
+{
+	QString base_path = edit_save_path_->text().trimmed();
+	if (base_path.isEmpty())
+	{
+		base_path = QCoreApplication::applicationDirPath();
+	}
+	return base_path + "/" + identityFolderName();
+}
+
+// ==================== status console ====================
+
+void XemaCameraWindow::initStatusConsole()
+{
+#ifdef _WIN32
+	if (AllocConsole())
+	{
+		SetConsoleTitleA("XEMA Camera GUI - detail log");
+
+		HANDLE h = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+			FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+		if (h != INVALID_HANDLE_VALUE)
+		{
+			console_handle_ = h;
+
+			CONSOLE_FONT_INFOEX cfi;
+			ZeroMemory(&cfi, sizeof(cfi));
+			cfi.cbSize = sizeof(cfi);
+			cfi.dwFontSize.Y = 18;
+			cfi.FontFamily = 0x04; // TMPF_TRUETYPE
+			cfi.FontWeight = FW_NORMAL;
+			wcscpy_s(cfi.FaceName, L"Consolas");
+			SetCurrentConsoleFontEx((HANDLE)h, FALSE, &cfi);
+
+			DWORD mode = 0;
+			if (GetConsoleMode((HANDLE)h, &mode))
+			{
+				SetConsoleMode((HANDLE)h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+			}
+		}
+	}
+#endif
+}
+
+QString XemaCameraWindow::colorizeForConsole(const QString& msg)
+{
+	QString lower = msg.toLower();
+	const char* color = "\x1b[37m";
+
+	if (lower.contains(u8"失败") || lower.contains(u8"错误") || lower.contains("fail") || lower.contains("error"))
+	{
+		color = "\x1b[91m"; // red
+	}
+	else if (lower.contains(u8"警告") || lower.contains("warning"))
+	{
+		color = "\x1b[93m"; // yellow
+	}
+	else if (lower.contains(u8"完成") || lower.contains(u8"成功") || lower.contains(u8"已恢复")
+		|| lower.contains(u8"已连接") || lower.contains("success"))
+	{
+		color = "\x1b[92m"; // green
+	}
+	else if (msg.startsWith(u8"运行:") || msg.startsWith("=========="))
+	{
+		color = "\x1b[96m"; // cyan
+	}
+
+	return QString(color) + msg + "\x1b[0m";
+}
+
+// Console-only, thread-safe (WriteFile to a console handle doesn't touch any Qt widget) --
+// use this from background threads for verbose detail (raw exe stdout, connection trace)
+// that shouldn't clutter the GUI's short summary log.
+void XemaCameraWindow::logConsoleOnly(const QString& msg)
+{
+#ifdef _WIN32
+	if (!console_handle_) return;
+
+	if (console_spinner_dirty_)
+	{
+		DWORD dummy = 0;
+		WriteFile((HANDLE)console_handle_, "\r\n", 2, &dummy, nullptr);
+		console_spinner_dirty_ = false;
+	}
+
+	QString colored = colorizeForConsole(msg);
+	QByteArray line = colored.toLocal8Bit() + "\r\n";
+	DWORD written = 0;
+	WriteFile((HANDLE)console_handle_, line.constData(), (DWORD)line.size(), &written, nullptr);
+#endif
+}
+
+// GUI status bar (single line, elided) + console -- must run on the GUI thread (touches
+// log_view_), so background threads use logConsoleOnly() directly and let the eventual
+// signal-driven finished-slot call this only for the short final summary. Multi-line
+// messages get flattened to " | "-separated segments for the GUI line; the console still
+// gets the original with real line breaks.
 void XemaCameraWindow::log(const QString& msg)
 {
-	log_view_->append(msg);
+	QString single_line = msg;
+	single_line.replace('\n', " | ");
+
+	QFontMetrics fm(log_view_->font());
+	int w = log_view_->width() > 100 ? log_view_->width() - 16 : 760;
+	log_view_->setText(fm.elidedText(single_line, Qt::ElideRight, w));
+
+	logConsoleOnly(msg);
 }
+
+// ==================== busy heartbeat ====================
+
+void XemaCameraWindow::startBusyHeartbeat(QLabel* label, const QString& prefix)
+{
+	busy_label_ = label;
+	busy_prefix_ = prefix;
+	if (busy_label_)
+	{
+		busy_label_->setText(prefix); // set once -- stays static, no animation in the GUI
+		busy_label_->setStyleSheet("");
+	}
+	spinner_index_ = 0;
+	busy_heartbeat_timer_.start(150);
+}
+
+void XemaCameraWindow::stopBusyHeartbeat()
+{
+	busy_heartbeat_timer_.stop();
+	busy_label_ = nullptr;
+}
+
+// Console-only animation -- the GUI status label stays a plain static line the whole time
+// (set once in startBusyHeartbeat), matching the "keep the tool simple, one line" request.
+void XemaCameraWindow::onBusyHeartbeat()
+{
+#ifdef _WIN32
+	if (console_handle_)
+	{
+		static const QChar frames[4] = { '|', '/', '-', '\\' };
+		QChar frame = frames[spinner_index_ % 4];
+
+		QString line = QString("\r\x1b[96m%1 %2 \x1b[0m").arg(busy_prefix_).arg(frame);
+		QByteArray bytes = line.toLocal8Bit();
+		DWORD written = 0;
+		WriteFile((HANDLE)console_handle_, bytes.constData(), (DWORD)bytes.size(), &written, nullptr);
+		console_spinner_dirty_ = true;
+	}
+#endif
+
+	spinner_index_++;
+}
+
+// ==================== connection state ====================
 
 void XemaCameraWindow::setConnectedUiState(bool connected)
 {
@@ -277,7 +483,8 @@ void XemaCameraWindow::setConnectedUiState(bool connected)
 	btn_disconnect_->setEnabled(connected);
 	btn_apply_params_->setEnabled(connected);
 	btn_capture_->setEnabled(connected);
-	btn_save_frame_->setEnabled(connected);
+	btn_capture_calib_->setEnabled(connected);
+	btn_write_params_->setEnabled(connected);
 }
 
 // ==================== connect ====================
@@ -325,9 +532,7 @@ void XemaCameraWindow::connectThreadFunc(QString ip)
 	DfGetProjectorVersion(projector_version_);
 
 	// Determines whether DfGetBrightnessData's output is clean grayscale (Mono sensor) or
-	// raw Bayer mosaic that needs de-mosaicing (BayerRG8 sensor) -- see header comment.
-	// Confirmed from camera_capture_gui.cpp's connect handler, which does exactly this and
-	// defaults to Mono if the query fails (same fallback used here).
+	// needs de-mosaicing internally (BayerRG8 sensor) -- diagnostic only, logged below.
 	int pixel_type_ret = DfGetCameraPixelType(pixel_type_);
 	if (pixel_type_ret != DF_SUCCESS)
 	{
@@ -340,16 +545,12 @@ void XemaCameraWindow::connectThreadFunc(QString ip)
 
 	QString sensor_desc = (pixel_type_ == (int)XemaPixelType::BayerRG8) ? u8"彩色(Bayer)" : u8"黑白(Mono)";
 
-	// Explicitly apply the configured capture engine right after connecting, rather than
-	// relying on the combo box's change signal having fired at the right time (it may have
-	// fired earlier, while connected_ was still false and thus skipped the DfSetCaptureEngine
-	// call). This guarantees the engine is actually set to what the UI shows, every connect.
-	DfSetCaptureEngine((XemaEngine)capture_engine_);
-	const char* engine_names[3] = { u8"普通(Normal)", u8"反光(Reflect)", u8"黑白(Black)" };
-	QString engine_desc = (capture_engine_ >= 0 && capture_engine_ <= 2) ? engine_names[capture_engine_] : u8"未知";
+	// Locked to Black -- confirmed working against the real vendor GUI's own Black setting.
+	// No UI to change this anymore; always set explicitly right after connecting.
+	int engine_ret = DfSetCaptureEngine(XemaEngine::Black);
 
-	emit connectFinished(true, QString(u8"连接成功。分辨率: %1x%2  固件: %3  光机型号: %4  传感器: %5  采集引擎: %6")
-		.arg(width_).arg(height_).arg(fw).arg(projector_version_).arg(sensor_desc).arg(engine_desc));
+	emit connectFinished(true, QString(u8"连接成功。分辨率: %1x%2  固件: %3  光机型号: %4  传感器: %5  采集引擎: 黑白(Black) (返回码 %6)")
+		.arg(width_).arg(height_).arg(fw).arg(projector_version_).arg(sensor_desc).arg(engine_ret));
 }
 
 void XemaCameraWindow::applyExposureRangeForProjector()
@@ -371,14 +572,8 @@ void XemaCameraWindow::applyExposureRangeForProjector()
 void XemaCameraWindow::logCurrentParamsInto(const QString& context, QStringList& lines_out)
 {
 	// Reads straight from the camera via DfGetParamLedCurrent/DfGetParamCameraExposure/
-	// DfGetParamCameraGain -- these are the params that actually affect DfCaptureData (the
-	// full structured-light capture this GUI uses), NOT DfGetParamGenerateBrightness/
-	// DfGetParamBrightnessGain (those are for the separate DfCaptureBrightnessData path,
-	// which this GUI doesn't call -- see header comment for the earlier bug this caused).
-	// Fresh queries, not just echoing back what we last sent, so if a Set call silently
-	// didn't take effect this readback shows the camera's real current value.
-	// Appends to lines_out instead of calling log() directly -- this function is called from
-	// background threads (applyParamsThreadFunc), and QTextEdit isn't thread-safe.
+	// DfGetParamCameraGain -- fresh queries, not just echoing back what we last sent, so if a
+	// Set call silently didn't take effect this readback shows the camera's real current value.
 	int led_rb = 0;
 	float exposure_rb = 0.0f, gain_rb = 0.0f;
 	int ret_led = DfGetParamLedCurrent(led_rb);
@@ -412,8 +607,6 @@ void XemaCameraWindow::onConnectFinished(bool ok, QString message)
 		setConnectedUiState(true);
 		applyExposureRangeForProjector();
 		label_image_->setText(u8"（已连接，尚未采集）");
-		// pull the firmware line back out of the combined message for the label -- simplest
-		// to just show a generic "connected" state here since the full detail is in the log
 		label_firmware_->setText(u8"固件版本: 已连接");
 		QStringList lines;
 		logCurrentParamsInto(u8"连接后", lines);
@@ -475,9 +668,6 @@ void XemaCameraWindow::onDisconnectFinished(QString message)
 	btn_capture_->setText(u8"开始连续采集");
 	label_firmware_->setText(u8"固件版本: -");
 	label_image_->setText(u8"（未连接）");
-	label_overexposure_->setText(u8"过曝: -");
-	label_board_->setText(u8"标定板: -");
-	label_board_->setStyleSheet("");
 
 	log(message);
 }
@@ -531,12 +721,6 @@ void XemaCameraWindow::applyParamsThreadFunc(int led, float gain, float exposure
 
 	lines << QString(u8"发送设置 -- LED:%1  增益:%2  曝光:%3").arg(led).arg(gain).arg(exposure);
 
-	// DfSetParamCameraExposure/DfSetParamCameraGain -- these are what actually affects
-	// DfCaptureData's output (confirmed from the real GUI's do_spin_camera_exposure_changed /
-	// do_doubleSpin_gain handlers). Only safe to call now that the capture loop has actually
-	// stopped (capture_thread_active_ == false) -- DfCaptureData holds the SDK's internal
-	// command mutex for the whole capture, so calling these while a capture is still
-	// in-flight is what caused the GUI-freeze bug this function exists to avoid.
 	int ret_led = DfSetParamLedCurrent(led);
 	int ret_exposure = DfSetParamCameraExposure(exposure);
 	int ret_gain = DfSetParamCameraGain(gain);
@@ -554,8 +738,6 @@ void XemaCameraWindow::applyParamsThreadFunc(int led, float gain, float exposure
 		lines << QString(u8"警告: 设置增益返回错误码 %1").arg(ret_gain);
 	}
 
-	// Read straight back from the camera rather than trusting the Set calls' return codes
-	// alone -- a SUCCESS return code doesn't guarantee the firmware actually applied it.
 	logCurrentParamsInto(u8"应用后", lines);
 
 	int led_check = 0;
@@ -600,88 +782,9 @@ void XemaCameraWindow::onApplyParamsFinished(QString message)
 
 // ==================== capture ====================
 
-QImage XemaCameraWindow::matToQImage(const cv::Mat& mat_bgr)
+QImage XemaCameraWindow::grayToQImage(const cv::Mat& gray)
 {
-	cv::Mat rgb;
-	cv::cvtColor(mat_bgr, rgb, cv::COLOR_BGR2RGB);
-	return QImage(rgb.data, rgb.cols, rgb.rows, (int)rgb.step, QImage::Format_RGB888).copy();
-}
-
-double XemaCameraWindow::markOverexposure(const cv::Mat& gray, cv::Mat& overlay_bgr_out)
-{
-	cv::cvtColor(gray, overlay_bgr_out, cv::COLOR_GRAY2BGR);
-
-	cv::Mat mask;
-	cv::threshold(gray, mask, kOverexposureThreshold, 255, cv::THRESH_BINARY);
-	overlay_bgr_out.setTo(cv::Scalar(0, 0, 255), mask); // BGR red
-
-	int overexposed_count = cv::countNonZero(mask);
-	double percent = 100.0 * overexposed_count / ((double)gray.rows * gray.cols);
-	return percent;
-}
-
-cv::Size XemaCameraWindow::boardGridSize() const
-{
-	// (cols, rows) -- see the ASSUMPTION comment on this declaration in the header
-	return cv::Size(9, 13);
-}
-
-bool XemaCameraWindow::detectBoard(const cv::Mat& gray, std::vector<cv::Point2f>& points_out)
-{
-	if (gray.empty())
-	{
-		return false;
-	}
-
-	cv::Mat inv;
-	cv::bitwise_not(gray, inv);
-
-	cv::Size board_size = boardGridSize();
-	const int flags = cv::CALIB_CB_ASYMMETRIC_GRID | cv::CALIB_CB_CLUSTERING;
-
-	cv::SimpleBlobDetector::Params p;
-	p.minArea = 40;
-	p.maxArea = 5000;
-	cv::Ptr<cv::SimpleBlobDetector> det = cv::SimpleBlobDetector::create(p);
-	if (cv::findCirclesGrid(inv, board_size, points_out, flags, det))
-	{
-		return true;
-	}
-
-	cv::Ptr<cv::SimpleBlobDetector> default_det = cv::SimpleBlobDetector::create();
-	if (cv::findCirclesGrid(inv, board_size, points_out, flags, default_det))
-	{
-		return true;
-	}
-
-	return cv::findCirclesGrid(inv, board_size, points_out, cv::CALIB_CB_ASYMMETRIC_GRID, det);
-}
-
-void XemaCameraWindow::onSaveFrameClicked()
-{
-	cv::Mat frame_copy;
-	{
-		std::lock_guard<std::mutex> lock(last_raw_gray_mutex_);
-		if (last_raw_gray_.empty())
-		{
-			log(u8"还没有采集过任何帧，无法保存");
-			return;
-		}
-		frame_copy = last_raw_gray_.clone();
-	}
-
-	QString filename = QCoreApplication::applicationDirPath() + "/"
-		+ QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss") + "_raw_frame.bmp";
-
-	bool ok = cv::imwrite(filename.toStdString(), frame_copy);
-	if (ok)
-	{
-		log(QString(u8"原始帧已保存: %1").arg(filename));
-	}
-	else
-	{
-		log(QString(u8"保存失败: %1").arg(filename));
-	}
+	return QImage(gray.data, gray.cols, gray.rows, (int)gray.step, QImage::Format_Grayscale8).copy();
 }
 
 void XemaCameraWindow::onCaptureToggled()
@@ -694,7 +797,7 @@ void XemaCameraWindow::onCaptureToggled()
 
 	if (!capturing_)
 	{
-		log(u8"========== 开始连续采集 ==========");
+		log(u8"开始连续采集");
 		capturing_ = true;
 		btn_capture_->setText(u8"停止采集");
 
@@ -724,10 +827,7 @@ void XemaCameraWindow::captureLoopThreadFunc()
 
 		// DfCaptureData triggers the real structured-light capture (projector fires the
 		// actual pattern sequence, firmware reconstructs depth+brightness from it) --
-		// exposure_num=1 matches the real GUI's non-HDR continuous-capture path
-		// (captureOneFrameBaseThread(false)). Previously this called
-		// DfCaptureBrightnessData directly, a lightweight standalone grab that skips pattern
-		// projection entirely -- see header comment for why that looked different/faster.
+		// exposure_num=1 matches the real GUI's non-HDR continuous-capture path.
 		char timestamp[64] = { 0 };
 		int ret = DfCaptureData(1, timestamp);
 
@@ -743,17 +843,6 @@ void XemaCameraWindow::captureLoopThreadFunc()
 		}
 
 		cv::Mat gray(height_, width_, CV_8UC1, cv::Scalar(0));
-		// DfGetBrightnessData ALREADY does pixel-type-aware Bayer->RGB->Gray conversion
-		// internally -- confirmed directly from open_cam3d.cpp's own implementation (the
-		// exact one this build links, not the separate cpp/xema_camera.cpp C++ wrapper):
-		// pixel_type_==Mono memcpy's directly, pixel_type_==BayerRG8 calls
-		// DfBayerToRgb+DfRgbToGray before returning. There is no raw-Bayer-passthrough case.
-		// An earlier version of this code second-guessed that and routed BayerRG8 through
-		// DfGetColorBrightnessData(Rgb) + our own cv::cvtColor instead -- unnecessary, and
-		// actively wrong for XemaEngine::Black specifically: Black mode's brightness_buf_
-		// is a mono-bypass capture, not real Bayer-patterned data, so de-mosaicing it with
-        // DfBayerToRgb (keyed only on the sensor's static pixel_type_, not the active
-        // engine) would have scrambled it. Just call this plain and let the SDK handle it.
 		int brightness_ret = DfGetBrightnessData(gray.data);
 
 		if (brightness_ret != DF_SUCCESS)
@@ -762,36 +851,7 @@ void XemaCameraWindow::captureLoopThreadFunc()
 			continue;
 		}
 
-		{
-			std::lock_guard<std::mutex> lock(last_raw_gray_mutex_);
-			last_raw_gray_ = gray.clone(); // exact SDK output, nothing drawn on it -- for "保存当前帧"
-		}
-
-		cv::Mat overlay;
-		double overexposed_percent = markOverexposure(gray, overlay);
-
-		std::vector<cv::Point2f> board_points;
-		bool board_found = detectBoard(gray, board_points);
-		if (board_found)
-		{
-			// Only draw when actually found -- drawChessboardCorners's not-found path draws
-			// every candidate point as a red X, which visually merges into the red
-			// overexposure overlay and makes the whole frame look uniformly red/confusing.
-			// Skipping the draw entirely when not found avoids that clash outright.
-			cv::drawChessboardCorners(overlay, boardGridSize(), board_points, true);
-		}
-
-		QString message = u8"采集完成。";
-		if (overexposed_percent >= kOverexposureWarnPercent)
-		{
-			message = QString(u8"采集完成 -- 警告: 过曝 %1%% 的像素").arg(overexposed_percent, 0, 'f', 2);
-		}
-		// board status is tucked into the message with a recognizable prefix rather than a
-		// new signal parameter -- onCaptureFinished parses it back out to update the board
-		// label. Keeps the existing captureFinished(bool,QString,QImage) signature stable.
-		message += board_found ? u8" [BOARD:FOUND]" : u8" [BOARD:NONE]";
-
-		emit captureFinished(true, message, matToQImage(overlay));
+		emit captureFinished(true, u8"采集完成。", grayToQImage(gray));
 	}
 
 	capture_thread_active_ = false;
@@ -799,27 +859,9 @@ void XemaCameraWindow::captureLoopThreadFunc()
 
 void XemaCameraWindow::onCaptureFinished(bool ok, QString message, QImage image)
 {
-	// Board status is tucked into the message as a recognizable suffix (see
-	// captureLoopThreadFunc) -- pull it out here and strip it before logging/matching, so
-	// the log and the overexposure-text check above don't see the marker as extra content.
-	bool board_found = false;
-	bool has_board_marker = false;
-	if (message.contains(u8"[BOARD:FOUND]"))
-	{
-		board_found = true;
-		has_board_marker = true;
-		message.remove(u8" [BOARD:FOUND]");
-	}
-	else if (message.contains(u8"[BOARD:NONE]"))
-	{
-		has_board_marker = true;
-		message.remove(u8" [BOARD:NONE]");
-	}
-
 	// During continuous capture, logging every single successful frame would flood the log
-	// view -- only failures and overexposure warnings get a log line. The image and
-	// overexposure/board labels still update every frame regardless, so nothing silent is lost.
-	if (!ok || message.contains(u8"过曝") || message.contains(u8"失败"))
+	// view -- only failures get a log line. The image still updates every frame regardless.
+	if (!ok)
 	{
 		log(message);
 	}
@@ -828,30 +870,423 @@ void XemaCameraWindow::onCaptureFinished(bool ok, QString message, QImage image)
 	{
 		label_image_->setPixmap(QPixmap::fromImage(image).scaled(
 			label_image_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+	}
+}
 
-		if (message.contains(u8"过曝"))
+// ==================== capture for calib ====================
+
+void XemaCameraWindow::onCaptureForCalibClicked()
+{
+	if (!connected_)
+	{
+		log(u8"请先连接相机");
+		return;
+	}
+
+	if (calib_capturing_)
+	{
+		log(u8"标定拍照正在进行中，请稍候...");
+		return;
+	}
+
+	QString ip = edit_ip_->text().trimmed();
+	if (ip.isEmpty())
+	{
+		log(u8"请输入相机IP");
+		return;
+	}
+
+	// Capture GUI state on the GUI thread before spawning -- QWidget reads aren't safe from
+	// a background thread. Bare zero-padded numeric folder name (00, 01, ...), NOT "pose_NN"
+	// -- confirmed from main_xema_color.py: calibration.exe scans bare-numbered subfolders
+	// directly under the identity path it's given.
+	QString save_folder = currentIdentityFolder() + QString("/%1").arg(calib_pose_index_, 2, 10, QChar('0'));
+	int led = spin_led_->value();
+	float gain = (float)spin_gain_->value();
+	float exposure = (float)spin_exposure_->value();
+
+	calib_capturing_ = true;
+	btn_capture_calib_->setEnabled(false);
+	btn_capture_->setEnabled(false); // don't let continuous capture toggle while we're mid stop/capture
+	btn_connect_->setEnabled(false);
+	btn_disconnect_->setEnabled(false);
+
+	std::thread t(&XemaCameraWindow::captureForCalibThreadFunc, this, ip, save_folder, led, gain, exposure);
+	t.detach();
+}
+
+int XemaCameraWindow::runExeBlocking(const QString& program, const QStringList& args, QString& out_output, int timeout_ms)
+{
+	QProcess proc;
+	proc.setProcessChannelMode(QProcess::MergedChannels);
+	proc.setWorkingDirectory(QCoreApplication::applicationDirPath());
+	proc.start(program, args);
+
+	if (!proc.waitForStarted(5000))
+	{
+		out_output = QString(u8"无法启动: %1 (请确认它和它的DLL在本程序所在目录)").arg(program);
+		return -1;
+	}
+
+	if (!proc.waitForFinished(timeout_ms))
+	{
+		proc.kill();
+		proc.waitForFinished(2000);
+		out_output = QString(u8"超时 (%1ms)，已终止").arg(timeout_ms);
+		return -2;
+	}
+
+	out_output = QString::fromLocal8Bit(proc.readAllStandardOutput()).trimmed();
+	return proc.exitCode();
+}
+
+void XemaCameraWindow::captureForCalibThreadFunc(QString ip, QString save_folder, int led, float gain, float exposure)
+{
+	QStringList lines;
+	bool was_capturing = capturing_;
+
+	if (was_capturing)
+	{
+		lines << u8"正在停止连续采集以进行标定拍照...";
+		capturing_ = false; // request stop
+
+		QElapsedTimer wait_timer;
+		wait_timer.start();
+		while (capture_thread_active_ && wait_timer.elapsed() < kCaptureStopTimeoutMs)
 		{
-			label_overexposure_->setText(u8"过曝: 警告");
-			label_overexposure_->setStyleSheet("color: red; font-weight: bold;");
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		}
+
+		if (capture_thread_active_)
+		{
+			lines << QString(u8"警告: 等待采集停止超时 (%1ms)，仍继续标定拍照 -- 可能短暂卡顿").arg(kCaptureStopTimeoutMs);
+		}
+	}
+
+	// NOTE: --get-raw-02's own server-side handler never touches exposure/gain/LED at all --
+	// it just fires a fixed projector pattern sequence and grabs raw frames. These Set calls
+	// don't affect what --get-raw-02 captures; kept only because they're still meaningful for
+	// whatever state the camera is in before/after this disconnect.
+	logConsoleOnly(QString(u8"发送标定拍照前设置 -- LED:%1  增益:%2  曝光:%3 (注意: --get-raw-02 不使用这些参数)").arg(led).arg(gain).arg(exposure));
+	DfSetParamLedCurrent(led);
+	DfSetParamCameraExposure(exposure);
+	DfSetParamCameraGain(gain);
+
+	QStringList param_confirm;
+	logCurrentParamsInto(u8"标定拍照前(断开前确认)", param_confirm);
+	logConsoleOnly(param_confirm.join('\n'));
+
+	// --get-raw-02 opens its OWN connection to the camera -- the camera very likely only
+	// accepts one client at a time, so our in-process DfConnect session has to step aside first.
+	lines << u8"断开当前连接，交由外部程序采集...";
+	DfDisconnect(ip.toStdString().c_str());
+	connected_ = false;
+
+	QDir().mkpath(save_folder);
+
+	QStringList args;
+	args << "--get-raw-02" << "--ip" << ip << "--path" << QDir::toNativeSeparators(save_folder);
+
+	logConsoleOnly(QString(u8"运行: open_cam3d.exe %1").arg(args.join(' ')));
+
+	QString exe_output;
+	int exit_code = runExeBlocking("open_cam3d.exe", args, exe_output, 60000);
+	logConsoleOnly(exe_output); // raw exe stdout -- verbose connection trace, console only
+	lines << QString(u8"采集完成 (退出码 %1)").arg(exit_code);
+
+	lines << u8"重新连接...";
+	int reconnect_ret = DfConnect(ip.toStdString().c_str());
+
+	QImage out_image;
+
+	if (reconnect_ret == DF_SUCCESS)
+	{
+		connected_ = true;
+		DfSetCaptureEngine(XemaEngine::Black);
+		DfSetParamLedCurrent(led);
+		DfSetParamCameraExposure(exposure);
+		DfSetParamCameraGain(gain);
+		lines << u8"重新连接成功，已恢复黑白引擎与当前参数";
+
+		QString preview_path = save_folder + "/phase36.bmp";
+		cv::Mat gray = cv::imread(preview_path.toStdString(), cv::IMREAD_GRAYSCALE);
+
+		if (!gray.empty())
+		{
+			lines << QString(u8"标定图像已保存: %1").arg(save_folder);
+			out_image = grayToQImage(gray);
+
+			if (exit_code == 0)
+			{
+				calib_pose_index_++;
+			}
 		}
 		else
 		{
-			label_overexposure_->setText(u8"过曝: 正常");
-			label_overexposure_->setStyleSheet("");
+			lines << QString(u8"警告: 未能读取预览图像 %1，请检查采集是否成功").arg(preview_path);
+		}
+	}
+	else
+	{
+		lines << QString(u8"重新连接失败，错误码: %1 -- 请手动点击连接").arg(reconnect_ret);
+	}
+
+	// Auto-resumes continuous capture afterward if it was running before.
+	if (was_capturing && connected_)
+	{
+		capturing_ = true;
+		std::thread resume_t(&XemaCameraWindow::captureLoopThreadFunc, this);
+		resume_t.detach();
+		lines << u8"连续采集已自动恢复";
+	}
+
+	emit calibCaptureFinished(lines.join('\n'), out_image);
+}
+
+void XemaCameraWindow::onCalibCaptureFinished(QString message, QImage image)
+{
+	log(message);
+
+	if (!image.isNull())
+	{
+		label_image_->setPixmap(QPixmap::fromImage(image).scaled(
+			label_image_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+	}
+
+	calib_capturing_ = false;
+	setConnectedUiState(connected_);
+	if (connected_)
+	{
+		label_firmware_->setText(u8"固件版本: 已连接");
+	}
+	btn_capture_->setText(capturing_ ? u8"停止采集" : u8"开始连续采集");
+}
+
+// ==================== calibrate ====================
+
+void XemaCameraWindow::onCalibrateClicked()
+{
+	if (calibrating_)
+	{
+		log(u8"标定正在进行中，请稍候...");
+		return;
+	}
+
+	QString identity_folder = currentIdentityFolder();
+
+	if (!QDir(identity_folder).exists())
+	{
+		log(QString(u8"未找到 %1 -- 请先用「拍照（用于标定）」采集至少几组姿态").arg(identity_folder));
+		return;
+	}
+
+	calibrating_ = true;
+	btn_calibrate_->setEnabled(false);
+	startBusyHeartbeat(label_calib_status_, u8"标定中");
+
+	std::thread t(&XemaCameraWindow::calibrateThreadFunc, this, identity_folder, projector_version_, (int)board_spacing_);
+	t.detach();
+}
+
+void XemaCameraWindow::calibrateThreadFunc(QString identity_folder, int projector_version, int board_spacing_mm)
+{
+	// Matches main_xema_color.py's calibrate() exactly:
+	//   calibration.exe --calibrate --use patterns-c --path <identity>/ --version <projector>
+	//     --board <spacing> --calib <identity>/param.txt
+	QString calib_path = identity_folder + "/param.txt";
+
+	// Delete any stale param.txt from a previous run first -- this exe's exit code isn't a
+	// reliable success signal (confirmed: a run that printed "Calibrate Finished!" with a
+	// reprojection error well under threshold still returned exit code 1). Freshly-written-
+	// this-run existence of calib_path is the actual evidence of success.
+	if (QFile::exists(calib_path))
+	{
+		QFile::remove(calib_path);
+	}
+
+	QStringList args;
+	args << "--calibrate" << "--use" << "patterns-c"
+		<< "--path" << QDir::toNativeSeparators(identity_folder + "/")
+		<< "--version" << QString::number(projector_version)
+		<< "--board" << QString::number(board_spacing_mm)
+		<< "--calib" << QDir::toNativeSeparators(calib_path);
+
+	logConsoleOnly(QString(u8"运行: calibration.exe %1").arg(args.join(' ')));
+
+	QString exe_output;
+	// Calibration across many poses can genuinely take minutes -- much longer timeout than
+	// the single-frame raw capture uses.
+	int exit_code = runExeBlocking("calibration.exe", args, exe_output, 600000);
+	logConsoleOnly(exe_output); // full board-detection/reprojection detail -- console only
+
+	bool ok = QFile::exists(calib_path);
+	QString message = ok
+		? QString(u8"标定完成: %1  (退出码 %2，仅供参考)").arg(calib_path).arg(exit_code)
+		: QString(u8"标定失败 -- 未生成 %1 (退出码 %2)").arg(calib_path).arg(exit_code);
+
+	emit calibrateFinished(message, ok);
+}
+
+void XemaCameraWindow::onCalibrateFinished(QString message, bool ok)
+{
+	stopBusyHeartbeat();
+	log(message);
+
+	calibrating_ = false;
+	btn_calibrate_->setEnabled(true);
+
+	if (ok)
+	{
+		label_calib_status_->setText(u8"标定: 完成");
+		label_calib_status_->setStyleSheet("color: green; font-weight: bold;");
+	}
+	else
+	{
+		label_calib_status_->setText(u8"标定: 失败");
+		label_calib_status_->setStyleSheet("color: red; font-weight: bold;");
+	}
+}
+
+// ==================== write params ====================
+
+void XemaCameraWindow::onWriteParamsClicked()
+{
+	if (!connected_)
+	{
+		log(u8"请先连接相机");
+		return;
+	}
+
+	if (writing_params_)
+	{
+		log(u8"写参数正在进行中，请稍候...");
+		return;
+	}
+
+	QString ip = edit_ip_->text().trimmed();
+	if (ip.isEmpty())
+	{
+		log(u8"请输入相机IP");
+		return;
+	}
+
+	QString calib_path = currentIdentityFolder() + "/param.txt";
+	if (!QFile::exists(calib_path))
+	{
+		log(QString(u8"未找到 %1 -- 请先成功运行标定").arg(calib_path));
+		return;
+	}
+
+	int led = spin_led_->value();
+	float gain = (float)spin_gain_->value();
+	float exposure = (float)spin_exposure_->value();
+
+	writing_params_ = true;
+	btn_write_params_->setEnabled(false);
+	btn_capture_calib_->setEnabled(false);
+	btn_capture_->setEnabled(false);
+	btn_connect_->setEnabled(false);
+	btn_disconnect_->setEnabled(false);
+	startBusyHeartbeat(label_write_status_, u8"写入中");
+
+	std::thread t(&XemaCameraWindow::writeParamsThreadFunc, this, ip, calib_path, led, gain, exposure);
+	t.detach();
+}
+
+void XemaCameraWindow::writeParamsThreadFunc(QString ip, QString calib_path, int led, float gain, float exposure)
+{
+	QStringList lines;
+	bool was_capturing = capturing_;
+
+	if (was_capturing)
+	{
+		lines << u8"正在停止连续采集以写入参数...";
+		capturing_ = false;
+
+		QElapsedTimer wait_timer;
+		wait_timer.start();
+		while (capture_thread_active_ && wait_timer.elapsed() < kCaptureStopTimeoutMs)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
 		}
 
-		if (has_board_marker)
+		if (capture_thread_active_)
 		{
-			if (board_found)
-			{
-				label_board_->setText(u8"标定板: 识别到");
-				label_board_->setStyleSheet("color: green; font-weight: bold;");
-			}
-			else
-			{
-				label_board_->setText(u8"标定板: 未识别");
-				label_board_->setStyleSheet("");
-			}
+			lines << QString(u8"警告: 等待采集停止超时 (%1ms)，仍继续写入参数 -- 可能短暂卡顿").arg(kCaptureStopTimeoutMs);
 		}
+	}
+
+	DfSetParamLedCurrent(led);
+	DfSetParamCameraExposure(exposure);
+	DfSetParamCameraGain(gain);
+
+	lines << u8"断开当前连接，交由外部程序写入参数...";
+	DfDisconnect(ip.toStdString().c_str());
+	connected_ = false;
+
+	QStringList args;
+	args << "--set-calib-looktable" << "--ip" << ip << "--path" << QDir::toNativeSeparators(calib_path);
+
+	logConsoleOnly(QString(u8"运行: open_cam3d.exe %1").arg(args.join(' ')));
+
+	QString exe_output;
+	int exit_code = runExeBlocking("open_cam3d.exe", args, exe_output, 60000);
+	logConsoleOnly(exe_output);
+	lines << QString(u8"写参数完成 (退出码 %1)").arg(exit_code);
+
+	lines << u8"重新连接...";
+	int reconnect_ret = DfConnect(ip.toStdString().c_str());
+
+	bool ok = false;
+
+	if (reconnect_ret == DF_SUCCESS)
+	{
+		connected_ = true;
+		DfSetCaptureEngine(XemaEngine::Black);
+		DfSetParamLedCurrent(led);
+		DfSetParamCameraExposure(exposure);
+		DfSetParamCameraGain(gain);
+		lines << u8"重新连接成功，已恢复黑白引擎与当前参数";
+
+		ok = (exit_code == 0);
+
+		if (was_capturing)
+		{
+			capturing_ = true;
+			std::thread resume_t(&XemaCameraWindow::captureLoopThreadFunc, this);
+			resume_t.detach();
+			lines << u8"连续采集已自动恢复";
+		}
+	}
+	else
+	{
+		lines << QString(u8"重新连接失败，错误码: %1 -- 请手动点击连接").arg(reconnect_ret);
+	}
+
+	emit writeParamsFinished(lines.join('\n'), ok);
+}
+
+void XemaCameraWindow::onWriteParamsFinished(QString message, bool ok)
+{
+	stopBusyHeartbeat();
+	log(message);
+
+	writing_params_ = false;
+	setConnectedUiState(connected_);
+	if (connected_)
+	{
+		label_firmware_->setText(u8"固件版本: 已连接");
+	}
+	btn_capture_->setText(capturing_ ? u8"停止采集" : u8"开始连续采集");
+
+	if (ok)
+	{
+		label_write_status_->setText(u8"写参数: 完成");
+		label_write_status_->setStyleSheet("color: green; font-weight: bold;");
+	}
+	else
+	{
+		label_write_status_->setText(u8"写参数: 失败");
+		label_write_status_->setStyleSheet("color: red; font-weight: bold;");
 	}
 }
