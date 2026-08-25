@@ -12,12 +12,17 @@
 #include <QJsonObject>
 #include <QDateTime>
 #include <QFontMetrics>
+#include <QEvent>
+#include <QColor>
+#include <QWheelEvent>
 #include <thread>
 #include <cmath>
+#include <algorithm>
 #include <QElapsedTimer>
 #include <QAbstractButton>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/calib3d.hpp>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -138,30 +143,44 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	// ---- capture ----
 	btn_capture_ = new QPushButton(u8"开始连续采集", this);
 	btn_capture_->setEnabled(false);
+
+	// "起始姿态编号" -- same mechanism as ScanToolWindow's combo_group_: item text IS the
+	// zero-padded pose number, currentIndex() doubles as the pose number directly. 50 slots
+	// (00-49) is generous headroom for a normal calibration session.
+	combo_start_pose_ = new QComboBox(this);
+	for (int i = 0; i < 50; i++)
+	{
+		combo_start_pose_->addItem(QString("%1").arg(i, 2, 10, QChar('0')));
+	}
+	combo_start_pose_->setToolTip(u8"下一次拍照保存到的姿态编号 -- 选择已有编号即可覆盖重拍那一组");
+
 	btn_capture_calib_ = new QPushButton(u8"拍照（用于标定）", this);
 	btn_capture_calib_->setEnabled(false);
 	btn_capture_calib_->setToolTip(u8"停止连续采集（如果正在运行），拍摄一张单独的标定用图像并保存编号");
 
+	btn_browse_poses_ = new QPushButton(u8"浏览已拍照片", this);
+	btn_browse_poses_->setEnabled(true); // works purely off disk -- no camera connection needed
+	btn_browse_poses_->setToolTip(u8"查看「标识/保存路径」下已保存的标定姿态照片，即使本次未拍照也可以浏览之前保存的");
+
 	QHBoxLayout* capture_row = new QHBoxLayout();
 	capture_row->addWidget(btn_capture_);
+	capture_row->addWidget(new QLabel(u8"起始:", this));
+	capture_row->addWidget(combo_start_pose_);
 	capture_row->addWidget(btn_capture_calib_);
+	capture_row->addWidget(btn_browse_poses_);
 
 	// ---- calibrate ----
 	btn_calibrate_ = new QPushButton(u8"标定", this);
 	btn_calibrate_->setEnabled(true); // no camera connection needed
 	btn_calibrate_->setToolTip(u8"对已拍摄的标定姿态运行 calibration.exe，不需要相机连接");
-	label_calib_status_ = new QLabel(u8"标定: -", this);
 
 	btn_write_params_ = new QPushButton(u8"写参数", this);
 	btn_write_params_->setEnabled(false); // needs a live connection, like capture-for-calib
 	btn_write_params_->setToolTip(u8"将标定结果 (param.txt) 写入相机 -- 需要先成功运行标定");
-	label_write_status_ = new QLabel(u8"写参数: -", this);
 
 	QHBoxLayout* calibrate_row = new QHBoxLayout();
 	calibrate_row->addWidget(btn_calibrate_);
-	calibrate_row->addWidget(label_calib_status_);
 	calibrate_row->addWidget(btn_write_params_);
-	calibrate_row->addWidget(label_write_status_);
 	calibrate_row->addStretch();
 
 	label_image_ = new QLabel(this);
@@ -169,6 +188,37 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	label_image_->setAlignment(Qt::AlignCenter);
 	label_image_->setText(u8"（未连接）");
 	label_image_->setStyleSheet("background-color:#222; color:#aaa; border: 1px solid #888;");
+
+	// ---- pose browse page (toggled in via btn_browse_poses_ -- see header comment) ----
+	preview_pose_list_ = new QListWidget(this);
+	preview_pose_list_->setFixedWidth(90);
+
+	preview_refresh_btn_ = new QPushButton(u8"刷新", this);
+	preview_refresh_btn_->setToolTip(u8"重新扫描文件夹（例如切换了标识/保存路径，或用其他方式添加了姿态）");
+
+	QVBoxLayout* pose_list_col = new QVBoxLayout();
+	pose_list_col->addWidget(new QLabel(u8"姿态", this));
+	pose_list_col->addWidget(preview_pose_list_, 1);
+	pose_list_col->addWidget(preview_refresh_btn_);
+
+	preview_window_image_label_ = new QLabel(this);
+	preview_window_image_label_->setAlignment(Qt::AlignCenter);
+	preview_window_image_label_->setMinimumHeight(350); // matches label_image_'s min height -- switching pages shouldn't resize the window
+	preview_window_image_label_->setText(u8"（未找到预览图）");
+	preview_window_image_label_->setStyleSheet("background-color:#222; color:#aaa; border: 1px solid #888;");
+	// Rescales the currently-shown photo live when this label is resized, and lets the mouse
+	// wheel step between poses while hovering it -- see eventFilter().
+	preview_window_image_label_->installEventFilter(this);
+
+	QWidget* pose_browse_page = new QWidget(this);
+	QHBoxLayout* pose_browse_row = new QHBoxLayout(pose_browse_page);
+	pose_browse_row->setContentsMargins(0, 0, 0, 0);
+	pose_browse_row->addLayout(pose_list_col);
+	pose_browse_row->addWidget(preview_window_image_label_, 1);
+
+	preview_stack_ = new QStackedWidget(this);
+	preview_stack_->addWidget(label_image_);    // page 0 -- live capture feed (default)
+	preview_stack_->addWidget(pose_browse_page); // page 1 -- pose browser
 
 	// ---- log ----
 	log_view_ = new QLabel(this);
@@ -183,7 +233,7 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	main_layout->addWidget(board_box);
 	main_layout->addLayout(capture_row);
 	main_layout->addLayout(calibrate_row);
-	main_layout->addWidget(label_image_, 1);
+	main_layout->addWidget(preview_stack_, 1);
 	main_layout->addWidget(log_view_);
 
 	connect(btn_connect_, &QPushButton::clicked, this, &XemaCameraWindow::onConnectClicked);
@@ -191,10 +241,13 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	connect(btn_apply_params_, &QPushButton::clicked, this, &XemaCameraWindow::onApplyParamsClicked);
 	connect(btn_capture_, &QPushButton::clicked, this, &XemaCameraWindow::onCaptureToggled);
 	connect(btn_capture_calib_, &QPushButton::clicked, this, &XemaCameraWindow::onCaptureForCalibClicked);
+	connect(btn_browse_poses_, &QPushButton::clicked, this, &XemaCameraWindow::onBrowsePosesClicked);
 	connect(btn_calibrate_, &QPushButton::clicked, this, &XemaCameraWindow::onCalibrateClicked);
 	connect(btn_write_params_, &QPushButton::clicked, this, &XemaCameraWindow::onWriteParamsClicked);
 	connect(btn_browse_save_path_, &QPushButton::clicked, this, &XemaCameraWindow::onBrowseSavePathClicked);
 	connect(group_board_spacing_, QOverload<QAbstractButton*>::of(&QButtonGroup::buttonClicked), this, &XemaCameraWindow::onBoardSpacingChanged);
+	connect(preview_pose_list_, &QListWidget::currentRowChanged, this, &XemaCameraWindow::onPreviewPoseListRowChanged);
+	connect(preview_refresh_btn_, &QPushButton::clicked, this, &XemaCameraWindow::onPreviewRefreshClicked);
 	connect(this, &XemaCameraWindow::connectFinished, this, &XemaCameraWindow::onConnectFinished);
 	connect(this, &XemaCameraWindow::captureFinished, this, &XemaCameraWindow::onCaptureFinished);
 	connect(this, &XemaCameraWindow::applyParamsFinished, this, &XemaCameraWindow::onApplyParamsFinished);
@@ -205,7 +258,7 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	connect(&busy_heartbeat_timer_, &QTimer::timeout, this, &XemaCameraWindow::onBusyHeartbeat);
 
 	loadConfig();
-	log(u8"就绪。");
+	log(XemaLogLevel::Info, u8"就绪", "Ready");
 }
 
 XemaCameraWindow::~XemaCameraWindow()
@@ -255,6 +308,11 @@ void XemaCameraWindow::loadConfig()
 	if (obj.contains("exposure")) spin_exposure_->setValue(obj.value("exposure").toDouble(spin_exposure_->value()));
 	if (obj.contains("identity")) edit_identity_->setText(obj.value("identity").toString());
 	if (obj.contains("save_path")) edit_save_path_->setText(obj.value("save_path").toString());
+	// Last known-good projector model from a previous session's successful connect -- lets
+	// Calibrate (which is designed to run fully offline, no camera needed) still pass the
+	// right --version to calibration.exe even if the camera hasn't been connected THIS
+	// session. A fresh connect below always overwrites this with the real detected value.
+	if (obj.contains("projector_version")) projector_version_ = obj.value("projector_version").toInt(0);
 
 	int spacing = obj.value("board_spacing_mm").toInt(80);
 	switch (spacing)
@@ -278,6 +336,7 @@ void XemaCameraWindow::saveConfig()
 	obj["board_spacing_mm"] = (int)board_spacing_;
 	obj["identity"] = edit_identity_->text();
 	obj["save_path"] = edit_save_path_->text();
+	obj["projector_version"] = projector_version_;
 
 	QFile f(path);
 	if (f.open(QIODevice::WriteOnly))
@@ -295,7 +354,9 @@ void XemaCameraWindow::onBoardSpacingChanged()
 	else if (radio_spacing_40_->isChecked()) board_spacing_ = XemaBoardSpacingMm::Spacing40;
 	else if (radio_spacing_80_->isChecked()) board_spacing_ = XemaBoardSpacingMm::Spacing80;
 
-	log(QString(u8"标定板间距设置为 %1mm").arg((int)board_spacing_));
+	log(XemaLogLevel::Info,
+		QString(u8"标定板间距: %1mm").arg((int)board_spacing_),
+		QString("Board spacing set to %1 mm").arg((int)board_spacing_));
 	saveConfig();
 }
 
@@ -339,7 +400,7 @@ void XemaCameraWindow::initStatusConsole()
 #ifdef _WIN32
 	if (AllocConsole())
 	{
-		SetConsoleTitleA("XEMA Camera GUI - detail log");
+		SetConsoleTitleA("XEMA Camera GUI - Log Console");
 
 		HANDLE h = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
 			FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -366,36 +427,45 @@ void XemaCameraWindow::initStatusConsole()
 #endif
 }
 
-QString XemaCameraWindow::colorizeForConsole(const QString& msg)
+QString XemaCameraWindow::levelTag(XemaLogLevel level)
 {
-	QString lower = msg.toLower();
-	const char* color = "\x1b[37m";
+	switch (level)
+	{
+	case XemaLogLevel::Warn:  return "[WARN]";
+	case XemaLogLevel::Error: return "[ERROR]";
+	case XemaLogLevel::Exec:  return "[EXEC]";
+	case XemaLogLevel::Info:
+	case XemaLogLevel::Success:
+	default:                  return "[INFO]"; // Success is informational -- color carries the distinction, not the tag
+	}
+}
 
-	if (lower.contains(u8"失败") || lower.contains(u8"错误") || lower.contains("fail") || lower.contains("error"))
+// Colors by explicit level now, not by grepping the message text for Chinese/English
+// keywords -- that guesswork is gone, and it means color no longer breaks if wording changes.
+// highlight=true adds bold on top of the level color, for lines worth the eye even inside a
+// wall of raw exe output (see logCalibExeOutput()).
+QString XemaCameraWindow::colorizeForConsole(XemaLogLevel level, const QString& tagged_msg, bool highlight)
+{
+	const char* color = "\x1b[37m"; // default: light grey (Info)
+
+	switch (level)
 	{
-		color = "\x1b[91m"; // red
-	}
-	else if (lower.contains(u8"警告") || lower.contains("warning"))
-	{
-		color = "\x1b[93m"; // yellow
-	}
-	else if (lower.contains(u8"完成") || lower.contains(u8"成功") || lower.contains(u8"已恢复")
-		|| lower.contains(u8"已连接") || lower.contains("success"))
-	{
-		color = "\x1b[92m"; // green
-	}
-	else if (msg.startsWith(u8"运行:") || msg.startsWith("=========="))
-	{
-		color = "\x1b[96m"; // cyan
+	case XemaLogLevel::Error:   color = "\x1b[91m"; break; // red
+	case XemaLogLevel::Warn:    color = "\x1b[93m"; break; // yellow
+	case XemaLogLevel::Success: color = "\x1b[92m"; break; // green
+	case XemaLogLevel::Exec:    color = "\x1b[96m"; break; // cyan
+	default: break;
 	}
 
-	return QString(color) + msg + "\x1b[0m";
+	QString bold = highlight ? "\x1b[1m" : "";
+	return bold + QString(color) + tagged_msg + "\x1b[0m";
 }
 
 // Console-only, thread-safe (WriteFile to a console handle doesn't touch any Qt widget) --
-// use this from background threads for verbose detail (raw exe stdout, connection trace)
-// that shouldn't clutter the GUI's short summary log.
-void XemaCameraWindow::logConsoleOnly(const QString& msg)
+// this is what background threads call directly for live, English, leveled progress (exe
+// invocations, raw subprocess stdout, disconnect/reconnect steps) that would flood the GUI's
+// one-line status if routed through log() instead.
+void XemaCameraWindow::logConsoleOnly(XemaLogLevel level, const QString& console_text, bool highlight)
 {
 #ifdef _WIN32
 	if (!console_handle_) return;
@@ -407,7 +477,10 @@ void XemaCameraWindow::logConsoleOnly(const QString& msg)
 		console_spinner_dirty_ = false;
 	}
 
-	QString colored = colorizeForConsole(msg);
+	QString tagged = levelTag(level) + " " + console_text;
+	QString colored = colorizeForConsole(level, tagged, highlight);
+	// toLocal8Bit on pure-ASCII English text also sidesteps any console-codepage mojibake
+	// that u8"..." Chinese text was prone to on a non-UTF-8 Windows console.
 	QByteArray line = colored.toLocal8Bit() + "\r\n";
 	DWORD written = 0;
 	WriteFile((HANDLE)console_handle_, line.constData(), (DWORD)line.size(), &written, nullptr);
@@ -415,53 +488,47 @@ void XemaCameraWindow::logConsoleOnly(const QString& msg)
 }
 
 // GUI status bar (single line, elided) + console -- must run on the GUI thread (touches
-// log_view_), so background threads use logConsoleOnly() directly and let the eventual
-// signal-driven finished-slot call this only for the short final summary. Multi-line
-// messages get flattened to " | "-separated segments for the GUI line; the console still
-// gets the original with real line breaks.
-void XemaCameraWindow::log(const QString& msg)
+// log_view_). Only called for the final result of a user action; everything in between was
+// already streamed to the console live via logConsoleOnly(). gui_text and console_text are
+// independent strings -- gui_text stays short Chinese, console_text is the English equivalent.
+void XemaCameraWindow::log(XemaLogLevel level, const QString& gui_text, const QString& console_text)
 {
-	QString single_line = msg;
+	QString single_line = gui_text;
 	single_line.replace('\n', " | ");
 
 	QFontMetrics fm(log_view_->font());
 	int w = log_view_->width() > 100 ? log_view_->width() - 16 : 760;
 	log_view_->setText(fm.elidedText(single_line, Qt::ElideRight, w));
 
-	logConsoleOnly(msg);
+	logConsoleOnly(level, console_text);
 }
 
 // ==================== busy heartbeat ====================
 
-void XemaCameraWindow::startBusyHeartbeat(QLabel* label, const QString& prefix)
+void XemaCameraWindow::startBusyHeartbeat(const QString& prefix)
 {
-	busy_label_ = label;
-	busy_prefix_ = prefix;
-	if (busy_label_)
-	{
-		busy_label_->setText(prefix); // set once -- stays static, no animation in the GUI
-		busy_label_->setStyleSheet("");
-	}
-	spinner_index_ = 0;
-	busy_heartbeat_timer_.start(150);
+	busy_prefix_ = prefix; // bracketed tag, e.g. "[calib] working" -- matches ScanToolWindow's convention
+	busy_spinner_index_ = 0;
+	busy_heartbeat_timer_.start(120);
 }
 
 void XemaCameraWindow::stopBusyHeartbeat()
 {
 	busy_heartbeat_timer_.stop();
-	busy_label_ = nullptr;
 }
 
-// Console-only animation -- the GUI status label stays a plain static line the whole time
-// (set once in startBusyHeartbeat), matching the "keep the tool simple, one line" request.
+// Matches ScanToolWindow::updateBusyIndicator() exactly: console gets a \r-overwritten |/-\
+// spinner, and log_view_ (our terminal-styled status box, playing the same role as
+// ScanToolWindow's label_status_) gets a single block character bouncing across a 12-char
+// '.'-filled track -- "[calib] working  [..#.......]" -- overwritten live each tick.
 void XemaCameraWindow::onBusyHeartbeat()
 {
+	static const QChar frames[4] = { '|', '/', '-', '\\' };
+	QChar frame = frames[busy_spinner_index_ % 4];
+
 #ifdef _WIN32
 	if (console_handle_)
 	{
-		static const QChar frames[4] = { '|', '/', '-', '\\' };
-		QChar frame = frames[spinner_index_ % 4];
-
 		QString line = QString("\r\x1b[96m%1 %2 \x1b[0m").arg(busy_prefix_).arg(frame);
 		QByteArray bytes = line.toLocal8Bit();
 		DWORD written = 0;
@@ -470,7 +537,22 @@ void XemaCameraWindow::onBusyHeartbeat()
 	}
 #endif
 
-	spinner_index_++;
+	const int width = 12;
+	int cycle = width * 2 - 2;
+	int pos = busy_spinner_index_ % cycle;
+	if (pos >= width)
+	{
+		pos = cycle - pos;
+	}
+
+	QString bar;
+	for (int i = 0; i < width; i++)
+	{
+		bar += (i == pos) ? QChar(0x2588) : QChar('.');
+	}
+	log_view_->setText(QString("%1  [%2]").arg(busy_prefix_, bar));
+
+	busy_spinner_index_++;
 }
 
 // ==================== connection state ====================
@@ -493,18 +575,18 @@ void XemaCameraWindow::onConnectClicked()
 {
 	if (busy_)
 	{
-		log(u8"操作进行中，请稍候...");
+		log(XemaLogLevel::Warn, u8"操作进行中，请稍候", "An operation is already in progress");
 		return;
 	}
 
 	QString ip = edit_ip_->text().trimmed();
 	if (ip.isEmpty())
 	{
-		log(u8"请输入相机IP");
+		log(XemaLogLevel::Warn, u8"请输入相机IP", "Camera IP is required");
 		return;
 	}
 
-	log(QString(u8"正在连接 %1 ...").arg(ip));
+	log(XemaLogLevel::Info, QString(u8"连接中: %1").arg(ip), QString("Connecting to %1...").arg(ip));
 	busy_ = true;
 	btn_connect_->setEnabled(false);
 
@@ -519,7 +601,9 @@ void XemaCameraWindow::connectThreadFunc(QString ip)
 
 	if (ret != DF_SUCCESS)
 	{
-		emit connectFinished(false, QString(u8"连接失败，错误码: %1").arg(ret));
+		emit connectFinished(false,
+			QString(u8"连接失败(%1)").arg(ret),
+			QString("Connect failed: DfConnect returned error code %1").arg(ret));
 		return;
 	}
 
@@ -541,16 +625,23 @@ void XemaCameraWindow::connectThreadFunc(QString ip)
 
 	char fw_buf[64] = { 0 };
 	int fw_ret = DfGetFirmwareVersion(fw_buf);
-	QString fw = (fw_ret == DF_SUCCESS) ? QString::fromUtf8(fw_buf) : QString(u8"获取失败");
+	QString fw = (fw_ret == DF_SUCCESS) ? QString::fromUtf8(fw_buf) : QString("unknown");
 
-	QString sensor_desc = (pixel_type_ == (int)XemaPixelType::BayerRG8) ? u8"彩色(Bayer)" : u8"黑白(Mono)";
+	QString sensor_desc_en = (pixel_type_ == (int)XemaPixelType::BayerRG8) ? "Bayer color" : "Mono";
 
 	// Locked to Black -- confirmed working against the real vendor GUI's own Black setting.
 	// No UI to change this anymore; always set explicitly right after connecting.
 	int engine_ret = DfSetCaptureEngine(XemaEngine::Black);
 
-	emit connectFinished(true, QString(u8"连接成功。分辨率: %1x%2  固件: %3  光机型号: %4  传感器: %5  采集引擎: 黑白(Black) (返回码 %6)")
-		.arg(width_).arg(height_).arg(fw).arg(projector_version_).arg(sensor_desc).arg(engine_ret));
+	logConsoleOnly(XemaLogLevel::Info, QString("Resolution %1x%2, firmware %3, projector %4, sensor %5")
+		.arg(width_).arg(height_).arg(fw).arg(projector_version_).arg(sensor_desc_en));
+	logConsoleOnly(engine_ret == DF_SUCCESS ? XemaLogLevel::Info : XemaLogLevel::Warn,
+		QString("Capture engine set to Black (return code %1)").arg(engine_ret));
+
+	emit connectFinished(true,
+		QString(u8"已连接 %1x%2").arg(width_).arg(height_),
+		QString("Connected to %1 (%2x%3, firmware %4, projector %5)")
+			.arg(ip).arg(width_).arg(height_).arg(fw).arg(projector_version_));
 }
 
 void XemaCameraWindow::applyExposureRangeForProjector()
@@ -563,13 +654,15 @@ void XemaCameraWindow::applyExposureRangeForProjector()
 	}
 	else if (projector_version_ != 3010)
 	{
-		log(QString(u8"未知光机型号 (%1)，曝光范围使用默认值").arg(projector_version_));
+		log(XemaLogLevel::Warn,
+			QString(u8"光机型号未知(%1)").arg(projector_version_),
+			QString("Unknown projector model (%1); using default exposure range [1700, 100000]").arg(projector_version_));
 	}
 
 	spin_exposure_->setRange(min_exposure, max_exposure); // Qt clamps the current value automatically if it falls outside
 }
 
-void XemaCameraWindow::logCurrentParamsInto(const QString& context, QStringList& lines_out)
+void XemaCameraWindow::logCurrentParamsInto(const QString& context)
 {
 	// Reads straight from the camera via DfGetParamLedCurrent/DfGetParamCameraExposure/
 	// DfGetParamCameraGain -- fresh queries, not just echoing back what we last sent, so if a
@@ -580,27 +673,417 @@ void XemaCameraWindow::logCurrentParamsInto(const QString& context, QStringList&
 	int ret_exposure = DfGetParamCameraExposure(exposure_rb);
 	int ret_gain = DfGetParamCameraGain(gain_rb);
 
-	lines_out << QString(u8"[%1] 相机当前实际值 -- LED:%2  增益:%3  曝光:%4")
-		.arg(context).arg(led_rb).arg(gain_rb).arg(exposure_rb);
+	logConsoleOnly(XemaLogLevel::Info, QString("[%1] Camera readback -- LED:%2  gain:%3  exposure:%4")
+		.arg(context).arg(led_rb).arg(gain_rb).arg(exposure_rb));
 
 	if (ret_led != DF_SUCCESS)
 	{
-		lines_out << QString(u8"[%1] 警告: 读取LED失败，错误码 %2").arg(context).arg(ret_led);
+		logConsoleOnly(XemaLogLevel::Warn, QString("[%1] Failed to read LED current (error code %2)").arg(context).arg(ret_led));
 	}
 	if (ret_exposure != DF_SUCCESS)
 	{
-		lines_out << QString(u8"[%1] 警告: 读取曝光失败，错误码 %2").arg(context).arg(ret_exposure);
+		logConsoleOnly(XemaLogLevel::Warn, QString("[%1] Failed to read exposure (error code %2)").arg(context).arg(ret_exposure));
 	}
 	if (ret_gain != DF_SUCCESS)
 	{
-		lines_out << QString(u8"[%1] 警告: 读取增益失败，错误码 %2").arg(context).arg(ret_gain);
+		logConsoleOnly(XemaLogLevel::Warn, QString("[%1] Failed to read gain (error code %2)").arg(context).arg(ret_gain));
 	}
 }
 
-void XemaCameraWindow::onConnectFinished(bool ok, QString message)
+// ==================== calibration.exe output filtering ====================
+
+// Full raw dump first (scroll up in the console for line-by-line detail), then a bolded
+// summary block with just the three numbers worth a glance: how many board images were read,
+// how many were actually detected, and the reprojection error -- colored green / yellow / red
+// against thresholds sb tuned by hand (see below), not the tool's own printed 0.1 line.
+// Structural lines ("Start Read Board Images......", "Start Find Board......") and the
+// redundant "Calibrate Finished!" (we already report our own pass/fail line) are dropped from
+// the summary -- they're still in the full dump above if needed.
+void XemaCameraWindow::logCalibExeOutput(const QString& raw_output)
+{
+	if (raw_output.isEmpty())
+	{
+		return;
+	}
+
+	logConsoleOnly(XemaLogLevel::Exec, "========== [calib] output ==========", true);
+	logConsoleOnly(XemaLogLevel::Info, raw_output); // full, unfiltered, passed through as-is
+	logConsoleOnly(XemaLogLevel::Exec, "========== end output ==========", true);
+
+	// Thresholds tuned by sb (2026-08-24) against real runs -- not from a spec:
+	//   < 0.1        clean pass -- green
+	//   0.1 - 0.2    still worth a look but not a real problem -- yellow
+	//   >= 0.2       red
+	const double kGoodMargin = 0.1;
+	const double kThreshold = 0.2;
+
+	QStringList lines = raw_output.split('\n');
+	QString board_images_line;
+	int found_count = 0;
+	bool have_reprojection = false;
+	double reprojection_error = 0.0;
+
+	for (const QString& raw_line : lines)
+	{
+		QString line = raw_line.trimmed();
+		if (line.isEmpty())
+		{
+			continue;
+		}
+
+		// calibration.exe repeats a bare "found" line per detected pose -- collapse the run
+		// into one count instead of echoing it N times in the summary.
+		if (line.compare("found", Qt::CaseInsensitive) == 0)
+		{
+			found_count++;
+			continue;
+		}
+
+		if (line.contains("Board Images Number", Qt::CaseInsensitive))
+		{
+			board_images_line = line;
+			continue;
+		}
+
+		// "Reprojection Error: 0.062862" -- but NOT the "...should be less than 0.1......"
+		// line, which also contains the phrase "Reprojection Error".
+		if (line.contains("Reprojection Error", Qt::CaseInsensitive)
+			&& !line.contains("should be less than", Qt::CaseInsensitive))
+		{
+			int colon = line.indexOf(':');
+			if (colon >= 0)
+			{
+				bool parsed_ok = false;
+				double value = line.mid(colon + 1).trimmed().toDouble(&parsed_ok);
+				if (parsed_ok)
+				{
+					reprojection_error = value;
+					have_reprojection = true;
+				}
+			}
+			continue;
+		}
+
+		// Everything else (section headers, the threshold-explanation line, "Calibrate
+		// Finished!") is intentionally left out of the summary -- see function comment.
+	}
+
+	logConsoleOnly(XemaLogLevel::Exec, "========== [calib] summary ==========", true);
+
+	bool have_summary_line = false;
+
+	if (!board_images_line.isEmpty())
+	{
+		logConsoleOnly(XemaLogLevel::Info, board_images_line, true);
+		have_summary_line = true;
+	}
+	if (found_count > 0)
+	{
+		logConsoleOnly(XemaLogLevel::Info, QString("found (x%1)").arg(found_count), true);
+		have_summary_line = true;
+	}
+	if (have_reprojection)
+	{
+		XemaLogLevel level;
+		if (reprojection_error < kGoodMargin)
+		{
+			level = XemaLogLevel::Success; // clean pass -- green, tagged [INFO]
+		}
+		else if (reprojection_error < kThreshold)
+		{
+			level = XemaLogLevel::Warn; // worth a look but not a real problem -- yellow, tagged [WARN]
+		}
+		else
+		{
+			level = XemaLogLevel::Error; // red, tagged [ERROR]
+		}
+
+		logConsoleOnly(level, QString("Reprojection Error: %1").arg(QString::number(reprojection_error, 'g', 6)), true);
+		have_summary_line = true;
+	}
+
+	if (!have_summary_line)
+	{
+		logConsoleOnly(XemaLogLevel::Warn, "[calib] no recognizable summary lines in output -- see full output above", true);
+	}
+}
+
+// See header comment: "<N>_board.bmp" is written for every pose calibration.exe processed,
+// "<N>_draw.bmp" only for poses where the board was actually found. Diffing the two gives the
+// exact list of poses to recapture, since calibration.exe's own stdout never names them. This
+// is logged as the last line of the "[calib] summary" block logCalibExeOutput just printed.
+void XemaCameraWindow::logMissingBoardPoses(const QString& identity_folder)
+{
+	QDir dir(identity_folder);
+	QStringList board_files = dir.entryList(QStringList() << "*_board.bmp", QDir::Files);
+
+	if (board_files.isEmpty())
+	{
+		// calibration.exe didn't get far enough to write per-pose board.bmp files (older
+		// version, or it failed before reaching board detection) -- nothing to check here.
+		return;
+	}
+
+	std::vector<int> pose_indices;
+	for (const QString& f : board_files)
+	{
+		int underscore = f.indexOf('_');
+		if (underscore <= 0)
+		{
+			continue;
+		}
+		bool parsed_ok = false;
+		int n = f.left(underscore).toInt(&parsed_ok);
+		if (parsed_ok)
+		{
+			pose_indices.push_back(n);
+		}
+	}
+	std::sort(pose_indices.begin(), pose_indices.end());
+
+	QStringList missing;
+	for (int n : pose_indices)
+	{
+		if (!QFile::exists(identity_folder + QString("/%1_draw.bmp").arg(n)))
+		{
+			missing << QString("%1").arg(n, 2, 10, QChar('0')); // zero-padded to match the pose capture folder naming
+		}
+	}
+
+	if (!missing.isEmpty())
+	{
+		logConsoleOnly(XemaLogLevel::Warn,
+			QString("[calib] board NOT detected in pose(s): %1 -- recapture these and re-run calibration").arg(missing.join(", ")),
+			true);
+	}
+	else
+	{
+		logConsoleOnly(XemaLogLevel::Info,
+			QString("[calib] board detected in all %1 pose(s)").arg(pose_indices.size()),
+			true);
+	}
+
+	logConsoleOnly(XemaLogLevel::Exec, "========== end summary ==========", true);
+}
+
+// ==================== pose browse page ====================
+
+// Rescans preview_identity_folder_ for numbered pose subfolders (same "00","01",... naming
+// captureForCalibThreadFunc writes), lists every one found. Color reflects the MOST RECENT
+// calibration run's result (grey = board not detected in "<N>_draw.bmp", or calibration.exe
+// simply hasn't been run yet; black = detected), NOT whether the pose has been captured -- see
+// header comment for why these are deliberately different signals. A "✓" is appended for any
+// pose in recaptured_poses_ (captured since that last calibration run, so its color is stale).
+// Tries to keep whatever pose was selected before the rescan; falls back to the most recent
+// pose if that one's gone or nothing was selected yet.
+void XemaCameraWindow::refreshPreviewPoseList()
+{
+	if (preview_identity_folder_.isEmpty())
+	{
+		return;
+	}
+
+	QDir dir(preview_identity_folder_);
+	QStringList subfolders = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+
+	QStringList numeric_folders;
+	for (const QString& f : subfolders)
+	{
+		bool parsed_ok = false;
+		f.toInt(&parsed_ok);
+		if (parsed_ok)
+		{
+			numeric_folders << f;
+		}
+	}
+	std::sort(numeric_folders.begin(), numeric_folders.end(),
+		[](const QString& a, const QString& b) { return a.toInt() < b.toInt(); });
+
+	QString previously_selected = (preview_current_row_ >= 0 && preview_current_row_ < preview_pose_labels_.size())
+		? preview_pose_labels_[preview_current_row_]
+		: QString();
+
+	preview_pose_labels_ = numeric_folders;
+
+	preview_pose_list_->blockSignals(true); // repopulating -- don't fire currentRowChanged mid-rebuild
+	preview_pose_list_->clear();
+	for (const QString& label : preview_pose_labels_)
+	{
+		// "<N>_draw.bmp" lives at the ROOT of identity_folder, N with NO zero-padding (unlike
+		// the pose subfolder names themselves) -- written by calibration.exe only when the
+		// board WAS detected for that pose in its most recent run.
+		int pose_num = label.toInt();
+		bool was_processed = QFile::exists(preview_identity_folder_ + QString("/%1_board.bmp").arg(pose_num));
+		bool board_detected = QFile::exists(preview_identity_folder_ + QString("/%1_draw.bmp").arg(pose_num));
+		bool failed = was_processed && !board_detected; // only grey if calibration actually checked it and it didn't pass
+
+		QString item_text = (failed && recaptured_poses_.contains(label)) ? label + u8" ✓" : label;
+		QListWidgetItem* item = new QListWidgetItem(item_text, preview_pose_list_);
+		if (failed && !recaptured_poses_.contains(label))
+		{
+			item->setForeground(QColor(150, 150, 150));
+		}
+	}
+	preview_pose_list_->blockSignals(false);
+
+	int restore_row = previously_selected.isEmpty() ? -1 : preview_pose_labels_.indexOf(previously_selected);
+	if (restore_row < 0 && !preview_pose_labels_.isEmpty())
+	{
+		restore_row = preview_pose_labels_.size() - 1; // default to the most recent pose
+	}
+
+	if (restore_row >= 0)
+	{
+		loadPreviewPoseAt(restore_row);
+	}
+	else
+	{
+		preview_current_row_ = -1;
+		preview_current_image_ = QImage();
+		preview_window_image_label_->setPixmap(QPixmap());
+		preview_window_image_label_->setText(u8"（未找到姿态照片）");
+	}
+}
+
+// Loads phase36.bmp -- the confirmed preview frame index, from main_xema_color.py's own
+// loadImage() (the original Python tool). Lives inside the pose's own zero-padded subfolder
+// (identity_folder/<pose>/phase36.bmp), so it's available as soon as a pose is captured,
+// unlike calibration.exe's <N>_draw.bmp/<N>_board.bmp diagnostic images which only exist after
+// a calibration run finishes. Shows the grey "not found" placeholder if it's missing (capture
+// never finished, or this pose was never actually taken).
+void XemaCameraWindow::loadPreviewPoseAt(int row)
+{
+	if (row < 0 || row >= preview_pose_labels_.size())
+	{
+		return;
+	}
+
+	preview_current_row_ = row;
+	QString pose_label = preview_pose_labels_[row];
+	QString image_path = preview_identity_folder_ + "/" + pose_label + "/phase36.bmp";
+
+	cv::Mat gray = cv::imread(image_path.toStdString(), cv::IMREAD_GRAYSCALE);
+	if (!gray.empty())
+	{
+		preview_current_image_ = grayToQImage(gray);
+	}
+	else
+	{
+		preview_current_image_ = QImage();
+	}
+
+	if (!preview_current_image_.isNull())
+	{
+		preview_window_image_label_->setPixmap(QPixmap::fromImage(preview_current_image_).scaled(
+			preview_window_image_label_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+	}
+	else
+	{
+		// grey "not found" placeholder -- same look as the rest of the tool's missing-preview state
+		preview_window_image_label_->setPixmap(QPixmap());
+		preview_window_image_label_->setText(u8"（未找到预览图）");
+	}
+
+	preview_pose_list_->blockSignals(true);
+	preview_pose_list_->setCurrentRow(row);
+	preview_pose_list_->blockSignals(false);
+}
+
+void XemaCameraWindow::onPreviewPoseListRowChanged(int row)
+{
+	if (row >= 0)
+	{
+		loadPreviewPoseAt(row);
+	}
+}
+
+void XemaCameraWindow::onPreviewPrevClicked()
+{
+	if (preview_current_row_ > 0)
+	{
+		loadPreviewPoseAt(preview_current_row_ - 1);
+	}
+}
+
+void XemaCameraWindow::onPreviewNextClicked()
+{
+	if (preview_current_row_ >= 0 && preview_current_row_ < preview_pose_labels_.size() - 1)
+	{
+		loadPreviewPoseAt(preview_current_row_ + 1);
+	}
+}
+
+void XemaCameraWindow::onPreviewRefreshClicked()
+{
+	refreshPreviewPoseList();
+}
+
+// "浏览已拍照片" -- toggles preview_stack_ between the live feed (page 0) and the pose
+// browser (page 1). Switching TO the browse page always rescans first, so it reflects
+// whatever's actually on disk even if nothing was captured this session, or captures happened
+// while the live page was showing (see refreshPreviewPoseListIfVisible()).
+void XemaCameraWindow::onBrowsePosesClicked()
+{
+	if (preview_stack_->currentIndex() == 0)
+	{
+		preview_identity_folder_ = currentIdentityFolder();
+		refreshPreviewPoseList();
+		preview_stack_->setCurrentIndex(1);
+		btn_browse_poses_->setText(u8"返回实时预览");
+	}
+	else
+	{
+		preview_stack_->setCurrentIndex(0);
+		btn_browse_poses_->setText(u8"浏览已拍照片");
+	}
+}
+
+// Called after each pose capture -- keeps the pose list's data current in the background
+// without yanking the view away from whatever the person is actually looking at. Only actually
+// rescans if the browse page happens to already be showing (the live page is far more likely
+// mid-capture); otherwise the eventual manual toggle in onBrowsePosesClicked rescans anyway.
+void XemaCameraWindow::refreshPreviewPoseListIfVisible()
+{
+	if (preview_stack_->currentIndex() == 1)
+	{
+		preview_identity_folder_ = currentIdentityFolder();
+		refreshPreviewPoseList();
+	}
+}
+
+// See header comment: rescales preview_current_image_ to fill preview_window_image_label_
+// whenever it's resized, and steps to the previous/next pose on mouse wheel while the cursor
+// is over the image (scroll up = previous, scroll down = next, matching the Prev/Next buttons).
+bool XemaCameraWindow::eventFilter(QObject* watched, QEvent* event)
+{
+	if (watched == preview_window_image_label_)
+	{
+		if (event->type() == QEvent::Resize && !preview_current_image_.isNull())
+		{
+			preview_window_image_label_->setPixmap(QPixmap::fromImage(preview_current_image_).scaled(
+				preview_window_image_label_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+		}
+		else if (event->type() == QEvent::Wheel)
+		{
+			QWheelEvent* wheel_event = static_cast<QWheelEvent*>(event);
+			if (wheel_event->angleDelta().y() > 0)
+			{
+				onPreviewPrevClicked(); // scroll up -- previous pose
+			}
+			else if (wheel_event->angleDelta().y() < 0)
+			{
+				onPreviewNextClicked(); // scroll down -- next pose
+			}
+			return true; // consume -- there's nothing else on this label that should scroll
+		}
+	}
+	return QWidget::eventFilter(watched, event);
+}
+
+void XemaCameraWindow::onConnectFinished(bool ok, QString guiMsg, QString consoleMsg)
 {
 	busy_ = false;
-	log(message);
+	log(ok ? XemaLogLevel::Success : XemaLogLevel::Error, guiMsg, consoleMsg);
 
 	if (ok)
 	{
@@ -608,9 +1091,7 @@ void XemaCameraWindow::onConnectFinished(bool ok, QString message)
 		applyExposureRangeForProjector();
 		label_image_->setText(u8"（已连接，尚未采集）");
 		label_firmware_->setText(u8"固件版本: 已连接");
-		QStringList lines;
-		logCurrentParamsInto(u8"连接后", lines);
-		log(lines.join('\n'));
+		logCurrentParamsInto("post-connect");
 		saveConfig();
 	}
 	else
@@ -636,11 +1117,11 @@ void XemaCameraWindow::onDisconnectClicked()
 
 void XemaCameraWindow::disconnectThreadFunc(QString ip)
 {
-	QStringList lines;
+	bool warned = false;
 
 	if (capturing_)
 	{
-		lines << u8"正在停止连续采集...";
+		logConsoleOnly(XemaLogLevel::Info, "Stopping continuous capture...");
 		capturing_ = false;
 
 		QElapsedTimer wait_timer;
@@ -652,24 +1133,32 @@ void XemaCameraWindow::disconnectThreadFunc(QString ip)
 
 		if (capture_thread_active_)
 		{
-			lines << QString(u8"警告: 等待采集停止超时 (%1ms)，仍继续断开").arg(kCaptureStopTimeoutMs);
+			logConsoleOnly(XemaLogLevel::Warn,
+				QString("Timed out waiting for capture to stop (%1 ms); disconnecting anyway").arg(kCaptureStopTimeoutMs));
+			warned = true;
 		}
 	}
 
 	int ret = DfDisconnect(ip.toStdString().c_str());
-	lines << (ret == DF_SUCCESS ? u8"已断开连接。" : QString(u8"断开时返回错误码: %1").arg(ret));
+	if (ret != DF_SUCCESS)
+	{
+		warned = true;
+	}
 
-	emit disconnectFinished(lines.join('\n'));
+	QString gui_msg = (ret == DF_SUCCESS) ? u8"已断开连接" : QString(u8"断开出错(%1)").arg(ret);
+	QString console_msg = (ret == DF_SUCCESS) ? "Disconnected" : QString("Disconnect returned error code %1").arg(ret);
+
+	emit disconnectFinished(gui_msg, console_msg, warned);
 }
 
-void XemaCameraWindow::onDisconnectFinished(QString message)
+void XemaCameraWindow::onDisconnectFinished(QString guiMsg, QString consoleMsg, bool warned)
 {
 	setConnectedUiState(false);
 	btn_capture_->setText(u8"开始连续采集");
 	label_firmware_->setText(u8"固件版本: -");
 	label_image_->setText(u8"（未连接）");
 
-	log(message);
+	log(warned ? XemaLogLevel::Warn : XemaLogLevel::Info, guiMsg, consoleMsg);
 }
 
 // ==================== params ====================
@@ -680,7 +1169,7 @@ void XemaCameraWindow::onApplyParamsClicked()
 
 	if (applying_params_)
 	{
-		log(u8"参数应用正在进行中，请稍候...");
+		log(XemaLogLevel::Warn, u8"参数应用中，请稍候", "Parameter apply already in progress");
 		return;
 	}
 
@@ -698,12 +1187,12 @@ void XemaCameraWindow::onApplyParamsClicked()
 
 void XemaCameraWindow::applyParamsThreadFunc(int led, float gain, float exposure)
 {
-	QStringList lines;
 	bool was_capturing = capturing_;
+	bool warned = false;
 
 	if (was_capturing)
 	{
-		lines << u8"正在暂停连续采集以应用参数...";
+		logConsoleOnly(XemaLogLevel::Info, "Pausing continuous capture to apply parameters...");
 		capturing_ = false; // request stop
 
 		QElapsedTimer wait_timer;
@@ -715,11 +1204,13 @@ void XemaCameraWindow::applyParamsThreadFunc(int led, float gain, float exposure
 
 		if (capture_thread_active_)
 		{
-			lines << QString(u8"警告: 等待采集停止超时 (%1ms)，仍继续应用参数 -- 可能短暂卡顿").arg(kCaptureStopTimeoutMs);
+			logConsoleOnly(XemaLogLevel::Warn,
+				QString("Timed out waiting for capture to stop (%1 ms); applying parameters anyway").arg(kCaptureStopTimeoutMs));
+			warned = true;
 		}
 	}
 
-	lines << QString(u8"发送设置 -- LED:%1  增益:%2  曝光:%3").arg(led).arg(gain).arg(exposure);
+	logConsoleOnly(XemaLogLevel::Info, QString("Sending parameters -- LED:%1  gain:%2  exposure:%3").arg(led).arg(gain).arg(exposure));
 
 	int ret_led = DfSetParamLedCurrent(led);
 	int ret_exposure = DfSetParamCameraExposure(exposure);
@@ -727,18 +1218,21 @@ void XemaCameraWindow::applyParamsThreadFunc(int led, float gain, float exposure
 
 	if (ret_led != DF_SUCCESS)
 	{
-		lines << QString(u8"警告: 设置LED返回错误码 %1").arg(ret_led);
+		logConsoleOnly(XemaLogLevel::Warn, QString("Set LED current returned error code %1").arg(ret_led));
+		warned = true;
 	}
 	if (ret_exposure != DF_SUCCESS)
 	{
-		lines << QString(u8"警告: 设置曝光返回错误码 %1").arg(ret_exposure);
+		logConsoleOnly(XemaLogLevel::Warn, QString("Set exposure returned error code %1").arg(ret_exposure));
+		warned = true;
 	}
 	if (ret_gain != DF_SUCCESS)
 	{
-		lines << QString(u8"警告: 设置增益返回错误码 %1").arg(ret_gain);
+		logConsoleOnly(XemaLogLevel::Warn, QString("Set gain returned error code %1").arg(ret_gain));
+		warned = true;
 	}
 
-	logCurrentParamsInto(u8"应用后", lines);
+	logCurrentParamsInto("post-apply");
 
 	int led_check = 0;
 	float exposure_check = 0.0f, gain_check = 0.0f;
@@ -748,31 +1242,37 @@ void XemaCameraWindow::applyParamsThreadFunc(int led, float gain, float exposure
 
 	if (std::abs(exposure_check - exposure) > 1.0f)
 	{
-		lines << QString(u8"!! 曝光设置似乎未生效 -- 发送:%1  相机返回:%2").arg(exposure).arg(exposure_check);
+		logConsoleOnly(XemaLogLevel::Warn, QString("Exposure did not take effect -- sent:%1  readback:%2").arg(exposure).arg(exposure_check));
+		warned = true;
 	}
 	if (std::abs(gain_check - gain) > 0.05f)
 	{
-		lines << QString(u8"!! 增益设置似乎未生效 -- 发送:%1  相机返回:%2").arg(gain).arg(gain_check);
+		logConsoleOnly(XemaLogLevel::Warn, QString("Gain did not take effect -- sent:%1  readback:%2").arg(gain).arg(gain_check));
+		warned = true;
 	}
 	if (led_check != led)
 	{
-		lines << QString(u8"!! LED设置似乎未生效 -- 发送:%1  相机返回:%2").arg(led).arg(led_check);
+		logConsoleOnly(XemaLogLevel::Warn, QString("LED current did not take effect -- sent:%1  readback:%2").arg(led).arg(led_check));
+		warned = true;
 	}
 
 	if (was_capturing)
 	{
-		lines << u8"恢复连续采集...";
 		capturing_ = true;
 		std::thread resume_t(&XemaCameraWindow::captureLoopThreadFunc, this);
 		resume_t.detach();
+		logConsoleOnly(XemaLogLevel::Info, "Continuous capture resumed");
 	}
 
-	emit applyParamsFinished(lines.join('\n'));
+	QString gui_msg = warned ? u8"参数已应用（有警告）" : u8"参数已应用";
+	QString console_msg = warned ? "Parameters applied with warnings -- see detail above" : "Parameters applied successfully";
+
+	emit applyParamsFinished(gui_msg, console_msg, warned);
 }
 
-void XemaCameraWindow::onApplyParamsFinished(QString message)
+void XemaCameraWindow::onApplyParamsFinished(QString guiMsg, QString consoleMsg, bool warned)
 {
-	log(message);
+	log(warned ? XemaLogLevel::Warn : XemaLogLevel::Success, guiMsg, consoleMsg);
 	applying_params_ = false;
 	btn_apply_params_->setEnabled(connected_);
 	btn_capture_->setEnabled(connected_);
@@ -787,17 +1287,52 @@ QImage XemaCameraWindow::grayToQImage(const cv::Mat& gray)
 	return QImage(gray.data, gray.cols, gray.rows, (int)gray.step, QImage::Format_Grayscale8).copy();
 }
 
+QImage XemaCameraWindow::colorToQImage(const cv::Mat& bgr)
+{
+	cv::Mat rgb;
+	cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
+	return QImage(rgb.data, rgb.cols, rgb.rows, (int)rgb.step, QImage::Format_RGB888).copy();
+}
+
+// See header comment: always applies both overlays, no toggle. 254 (not 255) matches the
+// firmware's own over-exposure threshold. Board detection uses calibration.exe's own algorithm
+// -- see header comment for the three independent source confirmations.
+QImage XemaCameraWindow::annotateLiveFrame(const cv::Mat& gray)
+{
+	cv::Mat bgr;
+	cv::cvtColor(gray, bgr, cv::COLOR_GRAY2BGR);
+
+	cv::Mat over_exposure_mask;
+	cv::threshold(gray, over_exposure_mask, 254, 255, cv::THRESH_BINARY);
+	bgr.setTo(cv::Scalar(0, 0, 255), over_exposure_mask); // BGR red
+
+	cv::Mat inverted;
+	cv::bitwise_not(gray, inverted);
+
+	static const cv::Size kBoardSize(7, 11); // cols x rows -- constant across all board spacings
+	std::vector<cv::Point2f> points;
+	bool found = cv::findCirclesGrid(inverted, kBoardSize, points,
+		cv::CALIB_CB_ASYMMETRIC_GRID | cv::CALIB_CB_CLUSTERING);
+
+	if (found)
+	{
+		cv::drawChessboardCorners(bgr, kBoardSize, cv::Mat(points), found); // works for circle grids too, not just chessboards
+	}
+
+	return colorToQImage(bgr);
+}
+
 void XemaCameraWindow::onCaptureToggled()
 {
 	if (!connected_)
 	{
-		log(u8"请先连接相机");
+		log(XemaLogLevel::Warn, u8"请先连接相机", "Connect to the camera first");
 		return;
 	}
 
 	if (!capturing_)
 	{
-		log(u8"开始连续采集");
+		log(XemaLogLevel::Info, u8"开始连续采集", "Continuous capture started");
 		capturing_ = true;
 		btn_capture_->setText(u8"停止采集");
 
@@ -806,7 +1341,7 @@ void XemaCameraWindow::onCaptureToggled()
 	}
 	else
 	{
-		log(u8"停止连续采集...");
+		log(XemaLogLevel::Info, u8"停止连续采集中", "Stopping continuous capture...");
 		capturing_ = false; // loop thread notices between frames and exits on its own
 		btn_capture_->setText(u8"开始连续采集");
 	}
@@ -820,7 +1355,7 @@ void XemaCameraWindow::captureLoopThreadFunc()
 	{
 		if (width_ <= 0 || height_ <= 0)
 		{
-			emit captureFinished(false, u8"分辨率未知（未连接？）", QImage());
+			emit captureFinished(false, u8"分辨率未知", "Unknown resolution -- not connected?", QImage());
 			capturing_ = false;
 			break;
 		}
@@ -838,7 +1373,8 @@ void XemaCameraWindow::captureLoopThreadFunc()
 
 		if (ret != DF_SUCCESS)
 		{
-			emit captureFinished(false, QString(u8"采集失败，错误码: %1").arg(ret), QImage());
+			emit captureFinished(false, QString(u8"采集失败(%1)").arg(ret),
+				QString("Capture failed: DfCaptureData returned error code %1").arg(ret), QImage());
 			continue; // keep looping -- a single failed frame shouldn't kill continuous capture
 		}
 
@@ -847,23 +1383,24 @@ void XemaCameraWindow::captureLoopThreadFunc()
 
 		if (brightness_ret != DF_SUCCESS)
 		{
-			emit captureFinished(false, QString(u8"获取亮度图失败，错误码: %1").arg(brightness_ret), QImage());
+			emit captureFinished(false, QString(u8"取图失败(%1)").arg(brightness_ret),
+				QString("Failed to read brightness data: error code %1").arg(brightness_ret), QImage());
 			continue;
 		}
 
-		emit captureFinished(true, u8"采集完成。", grayToQImage(gray));
+		emit captureFinished(true, u8"采集完成", "Frame captured", annotateLiveFrame(gray));
 	}
 
 	capture_thread_active_ = false;
 }
 
-void XemaCameraWindow::onCaptureFinished(bool ok, QString message, QImage image)
+void XemaCameraWindow::onCaptureFinished(bool ok, QString guiMsg, QString consoleMsg, QImage image)
 {
 	// During continuous capture, logging every single successful frame would flood the log
 	// view -- only failures get a log line. The image still updates every frame regardless.
 	if (!ok)
 	{
-		log(message);
+		log(XemaLogLevel::Error, guiMsg, consoleMsg);
 	}
 
 	if (ok && !image.isNull())
@@ -879,28 +1416,29 @@ void XemaCameraWindow::onCaptureForCalibClicked()
 {
 	if (!connected_)
 	{
-		log(u8"请先连接相机");
+		log(XemaLogLevel::Warn, u8"请先连接相机", "Connect to the camera first");
 		return;
 	}
 
 	if (calib_capturing_)
 	{
-		log(u8"标定拍照正在进行中，请稍候...");
+		log(XemaLogLevel::Warn, u8"标定拍照进行中，请稍候", "Calibration pose capture already in progress");
 		return;
 	}
 
 	QString ip = edit_ip_->text().trimmed();
 	if (ip.isEmpty())
 	{
-		log(u8"请输入相机IP");
+		log(XemaLogLevel::Warn, u8"请输入相机IP", "Camera IP is required");
 		return;
 	}
 
 	// Capture GUI state on the GUI thread before spawning -- QWidget reads aren't safe from
-	// a background thread. Bare zero-padded numeric folder name (00, 01, ...), NOT "pose_NN"
-	// -- confirmed from main_xema_color.py: calibration.exe scans bare-numbered subfolders
-	// directly under the identity path it's given.
-	QString save_folder = currentIdentityFolder() + QString("/%1").arg(calib_pose_index_, 2, 10, QChar('0'));
+	// a background thread. Item text IS the zero-padded pose number (see combo_start_pose_
+	// header comment) -- NOT "pose_NN" -- confirmed from main_xema_color.py: calibration.exe
+	// scans bare-numbered subfolders directly under the identity path it's given.
+	QString pose_label = combo_start_pose_->currentText();
+	QString save_folder = currentIdentityFolder() + "/" + pose_label;
 	int led = spin_led_->value();
 	float gain = (float)spin_gain_->value();
 	float exposure = (float)spin_exposure_->value();
@@ -911,7 +1449,7 @@ void XemaCameraWindow::onCaptureForCalibClicked()
 	btn_connect_->setEnabled(false);
 	btn_disconnect_->setEnabled(false);
 
-	std::thread t(&XemaCameraWindow::captureForCalibThreadFunc, this, ip, save_folder, led, gain, exposure);
+	std::thread t(&XemaCameraWindow::captureForCalibThreadFunc, this, ip, save_folder, pose_label, led, gain, exposure);
 	t.detach();
 }
 
@@ -924,7 +1462,7 @@ int XemaCameraWindow::runExeBlocking(const QString& program, const QStringList& 
 
 	if (!proc.waitForStarted(5000))
 	{
-		out_output = QString(u8"无法启动: %1 (请确认它和它的DLL在本程序所在目录)").arg(program);
+		out_output = QString("Failed to start %1 -- check that it and its DLLs are next to this program").arg(program);
 		return -1;
 	}
 
@@ -932,7 +1470,7 @@ int XemaCameraWindow::runExeBlocking(const QString& program, const QStringList& 
 	{
 		proc.kill();
 		proc.waitForFinished(2000);
-		out_output = QString(u8"超时 (%1ms)，已终止").arg(timeout_ms);
+		out_output = QString("Timed out after %1 ms -- process was killed").arg(timeout_ms);
 		return -2;
 	}
 
@@ -940,14 +1478,13 @@ int XemaCameraWindow::runExeBlocking(const QString& program, const QStringList& 
 	return proc.exitCode();
 }
 
-void XemaCameraWindow::captureForCalibThreadFunc(QString ip, QString save_folder, int led, float gain, float exposure)
+void XemaCameraWindow::captureForCalibThreadFunc(QString ip, QString save_folder, QString pose_label, int led, float gain, float exposure)
 {
-	QStringList lines;
 	bool was_capturing = capturing_;
 
 	if (was_capturing)
 	{
-		lines << u8"正在停止连续采集以进行标定拍照...";
+		logConsoleOnly(XemaLogLevel::Info, "Stopping continuous capture for calibration pose capture...");
 		capturing_ = false; // request stop
 
 		QElapsedTimer wait_timer;
@@ -959,7 +1496,8 @@ void XemaCameraWindow::captureForCalibThreadFunc(QString ip, QString save_folder
 
 		if (capture_thread_active_)
 		{
-			lines << QString(u8"警告: 等待采集停止超时 (%1ms)，仍继续标定拍照 -- 可能短暂卡顿").arg(kCaptureStopTimeoutMs);
+			logConsoleOnly(XemaLogLevel::Warn,
+				QString("Timed out waiting for capture to stop (%1 ms); proceeding with pose capture anyway").arg(kCaptureStopTimeoutMs));
 		}
 	}
 
@@ -967,18 +1505,17 @@ void XemaCameraWindow::captureForCalibThreadFunc(QString ip, QString save_folder
 	// it just fires a fixed projector pattern sequence and grabs raw frames. These Set calls
 	// don't affect what --get-raw-02 captures; kept only because they're still meaningful for
 	// whatever state the camera is in before/after this disconnect.
-	logConsoleOnly(QString(u8"发送标定拍照前设置 -- LED:%1  增益:%2  曝光:%3 (注意: --get-raw-02 不使用这些参数)").arg(led).arg(gain).arg(exposure));
+	logConsoleOnly(XemaLogLevel::Info,
+		QString("Pre-capture parameters -- LED:%1  gain:%2  exposure:%3 (note: --get-raw-02 does not use these)").arg(led).arg(gain).arg(exposure));
 	DfSetParamLedCurrent(led);
 	DfSetParamCameraExposure(exposure);
 	DfSetParamCameraGain(gain);
 
-	QStringList param_confirm;
-	logCurrentParamsInto(u8"标定拍照前(断开前确认)", param_confirm);
-	logConsoleOnly(param_confirm.join('\n'));
+	logCurrentParamsInto("pre-calib-capture, before disconnect");
 
 	// --get-raw-02 opens its OWN connection to the camera -- the camera very likely only
 	// accepts one client at a time, so our in-process DfConnect session has to step aside first.
-	lines << u8"断开当前连接，交由外部程序采集...";
+	logConsoleOnly(XemaLogLevel::Info, "Disconnecting in-process session so the external tool can capture...");
 	DfDisconnect(ip.toStdString().c_str());
 	connected_ = false;
 
@@ -987,17 +1524,26 @@ void XemaCameraWindow::captureForCalibThreadFunc(QString ip, QString save_folder
 	QStringList args;
 	args << "--get-raw-02" << "--ip" << ip << "--path" << QDir::toNativeSeparators(save_folder);
 
-	logConsoleOnly(QString(u8"运行: open_cam3d.exe %1").arg(args.join(' ')));
+	logConsoleOnly(XemaLogLevel::Exec, QString("[pose-capture] running: open_cam3d.exe %1").arg(args.join(' ')));
 
 	QString exe_output;
 	int exit_code = runExeBlocking("open_cam3d.exe", args, exe_output, 60000);
-	logConsoleOnly(exe_output); // raw exe stdout -- verbose connection trace, console only
-	lines << QString(u8"采集完成 (退出码 %1)").arg(exit_code);
+	if (!exe_output.isEmpty())
+	{
+		logConsoleOnly(XemaLogLevel::Exec, "========== [pose-capture] output ==========", true);
+		logConsoleOnly(XemaLogLevel::Info, exe_output); // raw subprocess stdout -- passed through as-is
+		logConsoleOnly(XemaLogLevel::Exec, "========== end ==========", true);
+	}
+	logConsoleOnly(exit_code == 0 ? XemaLogLevel::Info : XemaLogLevel::Warn,
+		QString("[pose-capture] finished (exit code %1)").arg(exit_code));
 
-	lines << u8"重新连接...";
+	logConsoleOnly(XemaLogLevel::Info, "Reconnecting...");
 	int reconnect_ret = DfConnect(ip.toStdString().c_str());
 
 	QImage out_image;
+	QString gui_msg;
+	QString console_msg;
+	bool ok = false;
 
 	if (reconnect_ret == DF_SUCCESS)
 	{
@@ -1006,29 +1552,33 @@ void XemaCameraWindow::captureForCalibThreadFunc(QString ip, QString save_folder
 		DfSetParamLedCurrent(led);
 		DfSetParamCameraExposure(exposure);
 		DfSetParamCameraGain(gain);
-		lines << u8"重新连接成功，已恢复黑白引擎与当前参数";
+		logConsoleOnly(XemaLogLevel::Info, "Reconnected -- Black engine and current parameters restored");
 
 		QString preview_path = save_folder + "/phase36.bmp";
 		cv::Mat gray = cv::imread(preview_path.toStdString(), cv::IMREAD_GRAYSCALE);
 
 		if (!gray.empty())
 		{
-			lines << QString(u8"标定图像已保存: %1").arg(save_folder);
 			out_image = grayToQImage(gray);
 
 			if (exit_code == 0)
 			{
-				calib_pose_index_++;
+				ok = true;
 			}
+
+			gui_msg = ok ? QString(u8"标定拍照完成，姿态已保存") : QString(u8"标定拍照完成但退出码异常(%1)").arg(exit_code);
+			console_msg = QString("Calibration pose saved to %1").arg(save_folder);
 		}
 		else
 		{
-			lines << QString(u8"警告: 未能读取预览图像 %1，请检查采集是否成功").arg(preview_path);
+			gui_msg = u8"标定拍照失败，未读取到预览图";
+			console_msg = QString("Failed to read preview image %1 -- capture may not have succeeded").arg(preview_path);
 		}
 	}
 	else
 	{
-		lines << QString(u8"重新连接失败，错误码: %1 -- 请手动点击连接").arg(reconnect_ret);
+		gui_msg = QString(u8"重连失败(%1)，请手动连接").arg(reconnect_ret);
+		console_msg = QString("Reconnect failed: error code %1 -- please connect manually").arg(reconnect_ret);
 	}
 
 	// Auto-resumes continuous capture afterward if it was running before.
@@ -1037,20 +1587,34 @@ void XemaCameraWindow::captureForCalibThreadFunc(QString ip, QString save_folder
 		capturing_ = true;
 		std::thread resume_t(&XemaCameraWindow::captureLoopThreadFunc, this);
 		resume_t.detach();
-		lines << u8"连续采集已自动恢复";
+		logConsoleOnly(XemaLogLevel::Info, "Continuous capture automatically resumed");
 	}
 
-	emit calibCaptureFinished(lines.join('\n'), out_image);
+	emit calibCaptureFinished(ok, gui_msg, console_msg, out_image, pose_label);
 }
 
-void XemaCameraWindow::onCalibCaptureFinished(QString message, QImage image)
+void XemaCameraWindow::onCalibCaptureFinished(bool ok, QString guiMsg, QString consoleMsg, QImage image, QString poseLabel)
 {
-	log(message);
+	log(ok ? XemaLogLevel::Success : XemaLogLevel::Error, guiMsg, consoleMsg);
 
 	if (!image.isNull())
 	{
 		label_image_->setPixmap(QPixmap::fromImage(image).scaled(
 			label_image_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+
+		// A real photo landed for this pose, regardless of the exe's own exit code -- its
+		// previous grey/black verdict (if any) is now stale until the next calibration run.
+		recaptured_poses_.insert(poseLabel);
+
+		// Same mechanism as ScanToolWindow::onShotClicked: advance to the next slot after a
+		// successful capture, capped at the last item -- doesn't move if the user deliberately
+		// picked an earlier number to recapture/overwrite a specific pose.
+		if (combo_start_pose_->currentIndex() < combo_start_pose_->count() - 1)
+		{
+			combo_start_pose_->setCurrentIndex(combo_start_pose_->currentIndex() + 1);
+		}
+
+		refreshPreviewPoseListIfVisible(); // keeps the pose list current in the background -- see header comment on why this doesn't auto-switch pages
 	}
 
 	calib_capturing_ = false;
@@ -1068,7 +1632,7 @@ void XemaCameraWindow::onCalibrateClicked()
 {
 	if (calibrating_)
 	{
-		log(u8"标定正在进行中，请稍候...");
+		log(XemaLogLevel::Warn, u8"标定进行中，请稍候", "Calibration already in progress");
 		return;
 	}
 
@@ -1076,13 +1640,29 @@ void XemaCameraWindow::onCalibrateClicked()
 
 	if (!QDir(identity_folder).exists())
 	{
-		log(QString(u8"未找到 %1 -- 请先用「拍照（用于标定）」采集至少几组姿态").arg(identity_folder));
+		log(XemaLogLevel::Warn,
+			QString(u8"未找到姿态目录: %1").arg(identity_folder),
+			QString("Pose folder not found: %1 -- capture at least a few poses first").arg(identity_folder));
 		return;
+	}
+
+	// projector_version_ is only ever set by a real DfGetProjectorVersion() at connect time (or
+	// loaded from a PREVIOUS session's successful connect, via loadConfig()) -- 3010/4710 are
+	// the only real models. If it's still 0 (never connected, ever, on this machine),
+	// calibration.exe would get an invalid --version 0. Calibration is designed to run fully
+	// offline on purpose, so this doesn't block -- just makes sure the reason for a likely-bad
+	// result is visible in the log instead of a silent wrong --version.
+	if (projector_version_ != 3010 && projector_version_ != 4710)
+	{
+		log(XemaLogLevel::Warn,
+			u8"光机型号未知，标定可能失败",
+			QString("Projector model unknown (currently %1) -- connect to the camera at least once (even briefly, then disconnect) so the correct --version is known and saved for future offline calibration runs").arg(projector_version_));
 	}
 
 	calibrating_ = true;
 	btn_calibrate_->setEnabled(false);
-	startBusyHeartbeat(label_calib_status_, u8"标定中");
+	logConsoleOnly(XemaLogLevel::Info, "[calib] starting");
+	startBusyHeartbeat("[calib] working");
 
 	std::thread t(&XemaCameraWindow::calibrateThreadFunc, this, identity_folder, projector_version_, (int)board_spacing_);
 	t.detach();
@@ -1111,40 +1691,36 @@ void XemaCameraWindow::calibrateThreadFunc(QString identity_folder, int projecto
 		<< "--board" << QString::number(board_spacing_mm)
 		<< "--calib" << QDir::toNativeSeparators(calib_path);
 
-	logConsoleOnly(QString(u8"运行: calibration.exe %1").arg(args.join(' ')));
+	logConsoleOnly(XemaLogLevel::Exec, QString("[calib] running: calibration.exe %1").arg(args.join(' ')));
 
 	QString exe_output;
 	// Calibration across many poses can genuinely take minutes -- much longer timeout than
 	// the single-frame raw capture uses.
 	int exit_code = runExeBlocking("calibration.exe", args, exe_output, 600000);
-	logConsoleOnly(exe_output); // full board-detection/reprojection detail -- console only
+	logCalibExeOutput(exe_output); // full raw dump, then a bolded summary block
+	logMissingBoardPoses(identity_folder); // diffs <N>_board.bmp vs <N>_draw.bmp on disk -- names exactly which poses to recapture, closes the summary block
 
 	bool ok = QFile::exists(calib_path);
-	QString message = ok
-		? QString(u8"标定完成: %1  (退出码 %2，仅供参考)").arg(calib_path).arg(exit_code)
-		: QString(u8"标定失败 -- 未生成 %1 (退出码 %2)").arg(calib_path).arg(exit_code);
+	QString gui_msg = ok ? u8"标定完成" : u8"标定失败";
+	QString console_msg = ok
+		? QString("[calib] finished -- %1 written").arg(calib_path)
+		: QString("[calib] failed -- %1 was not created (exit code %2)").arg(calib_path).arg(exit_code);
 
-	emit calibrateFinished(message, ok);
+	emit calibrateFinished(gui_msg, console_msg, ok);
 }
 
-void XemaCameraWindow::onCalibrateFinished(QString message, bool ok)
+void XemaCameraWindow::onCalibrateFinished(QString guiMsg, QString consoleMsg, bool ok)
 {
 	stopBusyHeartbeat();
-	log(message);
+	log(ok ? XemaLogLevel::Success : XemaLogLevel::Error, guiMsg, consoleMsg);
 
 	calibrating_ = false;
 	btn_calibrate_->setEnabled(true);
 
-	if (ok)
-	{
-		label_calib_status_->setText(u8"标定: 完成");
-		label_calib_status_->setStyleSheet("color: green; font-weight: bold;");
-	}
-	else
-	{
-		label_calib_status_->setText(u8"标定: 失败");
-		label_calib_status_->setStyleSheet("color: red; font-weight: bold;");
-	}
+	// Every pose's grey/black verdict is now freshly known (see refreshPreviewPoseList()) --
+	// any "✓" marks from captures since the last run are no longer meaningful either way.
+	recaptured_poses_.clear();
+	refreshPreviewPoseListIfVisible();
 }
 
 // ==================== write params ====================
@@ -1153,27 +1729,29 @@ void XemaCameraWindow::onWriteParamsClicked()
 {
 	if (!connected_)
 	{
-		log(u8"请先连接相机");
+		log(XemaLogLevel::Warn, u8"请先连接相机", "Connect to the camera first");
 		return;
 	}
 
 	if (writing_params_)
 	{
-		log(u8"写参数正在进行中，请稍候...");
+		log(XemaLogLevel::Warn, u8"写参数进行中，请稍候", "Write-parameters already in progress");
 		return;
 	}
 
 	QString ip = edit_ip_->text().trimmed();
 	if (ip.isEmpty())
 	{
-		log(u8"请输入相机IP");
+		log(XemaLogLevel::Warn, u8"请输入相机IP", "Camera IP is required");
 		return;
 	}
 
 	QString calib_path = currentIdentityFolder() + "/param.txt";
 	if (!QFile::exists(calib_path))
 	{
-		log(QString(u8"未找到 %1 -- 请先成功运行标定").arg(calib_path));
+		log(XemaLogLevel::Warn,
+			QString(u8"未找到 param.txt: %1").arg(calib_path),
+			QString("param.txt not found at %1 -- run calibration first").arg(calib_path));
 		return;
 	}
 
@@ -1187,7 +1765,8 @@ void XemaCameraWindow::onWriteParamsClicked()
 	btn_capture_->setEnabled(false);
 	btn_connect_->setEnabled(false);
 	btn_disconnect_->setEnabled(false);
-	startBusyHeartbeat(label_write_status_, u8"写入中");
+	logConsoleOnly(XemaLogLevel::Info, "[write] starting");
+	startBusyHeartbeat("[write] working");
 
 	std::thread t(&XemaCameraWindow::writeParamsThreadFunc, this, ip, calib_path, led, gain, exposure);
 	t.detach();
@@ -1195,12 +1774,11 @@ void XemaCameraWindow::onWriteParamsClicked()
 
 void XemaCameraWindow::writeParamsThreadFunc(QString ip, QString calib_path, int led, float gain, float exposure)
 {
-	QStringList lines;
 	bool was_capturing = capturing_;
 
 	if (was_capturing)
 	{
-		lines << u8"正在停止连续采集以写入参数...";
+		logConsoleOnly(XemaLogLevel::Info, "Stopping continuous capture to write parameters...");
 		capturing_ = false;
 
 		QElapsedTimer wait_timer;
@@ -1212,7 +1790,8 @@ void XemaCameraWindow::writeParamsThreadFunc(QString ip, QString calib_path, int
 
 		if (capture_thread_active_)
 		{
-			lines << QString(u8"警告: 等待采集停止超时 (%1ms)，仍继续写入参数 -- 可能短暂卡顿").arg(kCaptureStopTimeoutMs);
+			logConsoleOnly(XemaLogLevel::Warn,
+				QString("Timed out waiting for capture to stop (%1 ms); writing parameters anyway").arg(kCaptureStopTimeoutMs));
 		}
 	}
 
@@ -1220,24 +1799,32 @@ void XemaCameraWindow::writeParamsThreadFunc(QString ip, QString calib_path, int
 	DfSetParamCameraExposure(exposure);
 	DfSetParamCameraGain(gain);
 
-	lines << u8"断开当前连接，交由外部程序写入参数...";
+	logConsoleOnly(XemaLogLevel::Info, "Disconnecting in-process session so the external tool can write parameters...");
 	DfDisconnect(ip.toStdString().c_str());
 	connected_ = false;
 
 	QStringList args;
 	args << "--set-calib-looktable" << "--ip" << ip << "--path" << QDir::toNativeSeparators(calib_path);
 
-	logConsoleOnly(QString(u8"运行: open_cam3d.exe %1").arg(args.join(' ')));
+	logConsoleOnly(XemaLogLevel::Exec, QString("[write] running: open_cam3d.exe %1").arg(args.join(' ')));
 
 	QString exe_output;
 	int exit_code = runExeBlocking("open_cam3d.exe", args, exe_output, 60000);
-	logConsoleOnly(exe_output);
-	lines << QString(u8"写参数完成 (退出码 %1)").arg(exit_code);
+	if (!exe_output.isEmpty())
+	{
+		logConsoleOnly(XemaLogLevel::Exec, "========== [write] output ==========", true);
+		logConsoleOnly(XemaLogLevel::Info, exe_output);
+		logConsoleOnly(XemaLogLevel::Exec, "========== end ==========", true);
+	}
+	logConsoleOnly(exit_code == 0 ? XemaLogLevel::Info : XemaLogLevel::Warn,
+		QString("[write] finished (exit code %1)").arg(exit_code));
 
-	lines << u8"重新连接...";
+	logConsoleOnly(XemaLogLevel::Info, "Reconnecting...");
 	int reconnect_ret = DfConnect(ip.toStdString().c_str());
 
 	bool ok = false;
+	QString gui_msg;
+	QString console_msg;
 
 	if (reconnect_ret == DF_SUCCESS)
 	{
@@ -1246,30 +1833,35 @@ void XemaCameraWindow::writeParamsThreadFunc(QString ip, QString calib_path, int
 		DfSetParamLedCurrent(led);
 		DfSetParamCameraExposure(exposure);
 		DfSetParamCameraGain(gain);
-		lines << u8"重新连接成功，已恢复黑白引擎与当前参数";
+		logConsoleOnly(XemaLogLevel::Info, "Reconnected -- Black engine and current parameters restored");
 
 		ok = (exit_code == 0);
+		gui_msg = ok ? u8"写参数完成" : QString(u8"写参数完成但退出码异常(%1)").arg(exit_code);
+		console_msg = ok
+			? QString("Parameters written to camera successfully")
+			: QString("Write command exited with code %1 -- verify parameters on the camera").arg(exit_code);
 
 		if (was_capturing)
 		{
 			capturing_ = true;
 			std::thread resume_t(&XemaCameraWindow::captureLoopThreadFunc, this);
 			resume_t.detach();
-			lines << u8"连续采集已自动恢复";
+			logConsoleOnly(XemaLogLevel::Info, "Continuous capture automatically resumed");
 		}
 	}
 	else
 	{
-		lines << QString(u8"重新连接失败，错误码: %1 -- 请手动点击连接").arg(reconnect_ret);
+		gui_msg = QString(u8"重连失败(%1)，请手动连接").arg(reconnect_ret);
+		console_msg = QString("Reconnect failed: error code %1 -- please connect manually").arg(reconnect_ret);
 	}
 
-	emit writeParamsFinished(lines.join('\n'), ok);
+	emit writeParamsFinished(gui_msg, console_msg, ok);
 }
 
-void XemaCameraWindow::onWriteParamsFinished(QString message, bool ok)
+void XemaCameraWindow::onWriteParamsFinished(QString guiMsg, QString consoleMsg, bool ok)
 {
 	stopBusyHeartbeat();
-	log(message);
+	log(ok ? XemaLogLevel::Success : XemaLogLevel::Error, guiMsg, consoleMsg);
 
 	writing_params_ = false;
 	setConnectedUiState(connected_);
@@ -1278,15 +1870,4 @@ void XemaCameraWindow::onWriteParamsFinished(QString message, bool ok)
 		label_firmware_->setText(u8"固件版本: 已连接");
 	}
 	btn_capture_->setText(capturing_ ? u8"停止采集" : u8"开始连续采集");
-
-	if (ok)
-	{
-		label_write_status_->setText(u8"写参数: 完成");
-		label_write_status_->setStyleSheet("color: green; font-weight: bold;");
-	}
-	else
-	{
-		label_write_status_->setText(u8"写参数: 失败");
-		label_write_status_->setStyleSheet("color: red; font-weight: bold;");
-	}
 }

@@ -12,6 +12,10 @@
 #include <QButtonGroup>
 #include <QProcess>
 #include <QTimer>
+#include <QStackedWidget>
+#include <QListWidget>
+#include <QComboBox>
+#include <QSet>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -58,6 +62,18 @@ enum class XemaBoardSpacingMm
 	Spacing80 = 80,
 };
 
+// Console log levels. Replaces the old approach of grepping the message text for Chinese
+// substrings ("失败"/"警告"/etc) to guess a color -- the caller now states the level
+// explicitly, which also drives the "[INFO]/[WARN]/[ERROR]/[EXEC]" tag written to the console.
+enum class XemaLogLevel
+{
+	Info,    // normal status
+	Success, // notable positive outcome -- tagged [INFO], colored green
+	Warn,    // recoverable problem, degraded result, or a value that didn't take effect
+	Error,   // operation failed
+	Exec,    // subprocess invocation / raw subprocess output block markers
+};
+
 // Minimal XEMA camera control GUI: connect, adjust LED/gain/exposure, continuously capture
 // grayscale frames, capture calibration poses, run calibration.exe, write params back to the
 // camera, disconnect.
@@ -69,61 +85,153 @@ public:
 	XemaCameraWindow(QWidget* parent = nullptr);
 	~XemaCameraWindow();
 
+	// Rescales preview_current_image_ live when preview_window_image_label_ is resized (see
+	// installEventFilter() call in the constructor), and handles mouse-wheel pose navigation --
+	// so the pose photo actually fills the label when the main window is resized instead of
+	// staying pinned at whatever size it was when first loaded.
+	bool eventFilter(QObject* watched, QEvent* event) override;
+
 signals:
-	void connectFinished(bool ok, QString message);
-	void captureFinished(bool ok, QString message, QImage image);
-	void applyParamsFinished(QString message);
-	void disconnectFinished(QString message);
-	void calibCaptureFinished(QString message, QImage image);
-	void calibrateFinished(QString message, bool ok);
-	void writeParamsFinished(QString message, bool ok);
+	// Every "Finished" signal now carries TWO strings for one event: guiMsg is short and in
+	// Chinese (matches the rest of the UI), consoleMsg is the same result phrased as a clean
+	// English sentence for the console. They're deliberately independent -- see log().
+	void connectFinished(bool ok, QString guiMsg, QString consoleMsg);
+	void captureFinished(bool ok, QString guiMsg, QString consoleMsg, QImage image);
+	void applyParamsFinished(QString guiMsg, QString consoleMsg, bool warned);
+	void disconnectFinished(QString guiMsg, QString consoleMsg, bool warned);
+	void calibCaptureFinished(bool ok, QString guiMsg, QString consoleMsg, QImage image, QString poseLabel);
+	void calibrateFinished(QString guiMsg, QString consoleMsg, bool ok);
+	void writeParamsFinished(QString guiMsg, QString consoleMsg, bool ok);
 
 private slots:
 	void onConnectClicked();
 	void onDisconnectClicked();
 	void onApplyParamsClicked();
 	void onCaptureToggled();
-	void onConnectFinished(bool ok, QString message);
-	void onCaptureFinished(bool ok, QString message, QImage image);
-	void onApplyParamsFinished(QString message);
-	void onDisconnectFinished(QString message);
+	void onConnectFinished(bool ok, QString guiMsg, QString consoleMsg);
+	void onCaptureFinished(bool ok, QString guiMsg, QString consoleMsg, QImage image);
+	void onApplyParamsFinished(QString guiMsg, QString consoleMsg, bool warned);
+	void onDisconnectFinished(QString guiMsg, QString consoleMsg, bool warned);
 	void onBoardSpacingChanged();
 	void onCaptureForCalibClicked();
-	void onCalibCaptureFinished(QString message, QImage image);
+	void onCalibCaptureFinished(bool ok, QString guiMsg, QString consoleMsg, QImage image, QString poseLabel);
 	void onCalibrateClicked();
-	void onCalibrateFinished(QString message, bool ok);
+	void onCalibrateFinished(QString guiMsg, QString consoleMsg, bool ok);
 	void onWriteParamsClicked();
-	void onWriteParamsFinished(QString message, bool ok);
+	void onWriteParamsFinished(QString guiMsg, QString consoleMsg, bool ok);
 	void onBrowseSavePathClicked();
 	void onBusyHeartbeat();
+	void onBrowsePosesClicked(); // toggles preview_stack_ between live view and pose browse view (was "open a window" -- now a same-window toggle)
+	void onPreviewPoseListRowChanged(int row);
+	void onPreviewPrevClicked();
+	void onPreviewNextClicked();
+	void onPreviewRefreshClicked();
 
 private:
-	// Status console: a real Windows console window opened alongside the GUI. Unlike the
-	// in-GUI log box (short, curated status lines only), the console gets the FULL verbose
-	// detail -- raw stdout from calibration.exe/open_cam3d.exe, connection trace lines, etc.
-	// via logConsoleOnly(), which is thread-safe (no Qt widget touched) and callable directly
-	// from background threads without waiting for a signal round-trip. log() writes to both.
+	// Status console: a real Windows console window opened alongside the GUI. The two outputs
+	// now deliberately carry DIFFERENT text, not a copy of the same string:
+	//   - GUI (log_view_, via log()): one short, curated Chinese status line per user action --
+	//     "already accurate, but brief" per its single-line elided design.
+	//   - Console (via logConsoleOnly()): a full English, leveled ([INFO]/[WARN]/[ERROR]/[EXEC])
+	//     trace, including live step-by-step progress from background threads (disconnect-for-
+	//     exe, exe invocation + raw stdout, reconnect, etc) that would flood the GUI line if
+	//     shown there. logConsoleOnly() is thread-safe (WriteFile to a console handle touches no
+	//     Qt widget) and callable directly from background threads without a signal round-trip.
+	// log() is only ever called from the GUI thread (mirrors the final result of a user action
+	// into both places); logConsoleOnly() is used for everything in between.
 	void initStatusConsole();
-	static QString colorizeForConsole(const QString& msg);
-	void logConsoleOnly(const QString& msg); // full verbose detail -- console only, thread-safe
-	void log(const QString& msg);            // curated summary -- GUI box + console
+	static QString levelTag(XemaLogLevel level);   // "[INFO]" / "[WARN]" / "[ERROR]" / "[EXEC]"
+	static QString colorizeForConsole(XemaLogLevel level, const QString& tagged_msg, bool highlight);
+	// highlight=true renders the line bold, for lines worth the reader's eye even in a wall of
+	// exe output (board-recognition summary, reprojection error) -- see logCalibExeOutput().
+	void logConsoleOnly(XemaLogLevel level, const QString& console_text, bool highlight = false);
+	void log(XemaLogLevel level, const QString& gui_text, const QString& console_text); // GUI box + console
 	void* console_handle_ = nullptr;
 	bool console_spinner_dirty_ = false; // true if the last console write was a \r spinner overwrite with no trailing \n -- next real log line needs a newline first
 
-	// Busy spinner: while a long-running exe is in flight, a QTimer drives a console |/-\
-	// overwrite. GUI stays a plain static status line (set once by startBusyHeartbeat) --
-	// no animation in the GUI itself, only in the real console window.
-	void startBusyHeartbeat(QLabel* label, const QString& prefix);
+	// Prints calibration.exe's raw stdout in FULL (nothing hidden -- scroll up in the console
+	// for line-by-line detail), then a bolded summary block underneath pulling out just the
+	// lines that matter (board image count, reprojection error, pass/fail; repeated "found"
+	// lines collapsed into one count) so the takeaway is visible without scrolling.
+	void logCalibExeOutput(const QString& raw_output);
+
+	// calibration.exe's stdout never names WHICH pose failed board detection ("found" is
+	// printed with no pose number attached) -- but it writes "<N>_board.bmp" for every pose it
+	// processed and "<N>_draw.bmp" (an annotated visualization) ONLY for poses where the board
+	// was actually found. Diffing those two sets on disk recovers exactly which poses need to
+	// be recaptured. Confirmed by sb from a live folder listing (2026-08-24) -- board.bmp always
+	// present, draw.bmp only on success. Logs a highlighted [WARN] listing the missing pose
+	// numbers (zero-padded to match the capture folder naming, e.g. "07"), or a highlighted
+	// [INFO] confirming all poses were detected if none are missing. Called as part of the
+	// same summary block logCalibExeOutput prints, so it's the last thing before the result.
+	void logMissingBoardPoses(const QString& identity_folder);
+
+	// Pose browsing lives in the SAME area as the live capture preview now (not a separate
+	// window) -- preview_stack_ is a QStackedWidget with two pages: page 0 is label_image_
+	// (today's live feed, untouched), page 1 is the pose-browse page (list + big image) built
+	// once here at construction time. btn_browse_poses_ ("浏览已拍照片") just flips
+	// preview_stack_'s current page; nothing is created/destroyed on toggle. Deliberately does
+	// NOT auto-switch to the browse page after a fresh capture (that would yank the live feed
+	// away mid-session, e.g. while rapid-capturing several poses back to back) -- capturing
+	// just quietly keeps the pose list's data current in the background (see
+	// refreshPreviewPoseListIfVisible()) so switching to it later shows the latest.
+	//
+	// Two DIFFERENT data sources, deliberately not the same file:
+	//   - List color (grey/black): calibration.exe's own diagnostic output -- "<N>_draw.bmp"
+	//     (root of identity_folder, no zero-padding) existing means the board WAS detected for
+	//     that pose in the most recent calibration run. No draw.bmp = grey, whether that's
+	//     because the board wasn't found or calibration.exe simply hasn't been run yet. This
+	//     only updates when a calibration run actually finishes (see onCalibrateFinished) --
+	//     capturing a pose does NOT touch its color, only its checkmark (below).
+	//   - Displayed image: phase36.bmp (identity_folder/<pose>/phase36.bmp, INSIDE the pose's
+	//     own zero-padded subfolder) -- the confirmed preview frame index from
+	//     main_xema_color.py's own loadImage() (the original Python tool). Available the moment
+	//     a pose is captured, well before any calibration has run, so you can always see what
+	//     was actually photographed regardless of whether it's been verified yet.
+	//   - Checkmark ("✓" appended to the label): tracks recaptured_poses_ -- a pose you just
+	//     (re)captured since the last calibration run, so its grey/black color is stale and
+	//     hasn't been re-verified yet. Cleared entirely the next time Calibrate finishes, at
+	//     which point the color reflects the fresh result instead.
+	// Navigate by clicking a list entry or scrolling the mouse wheel over the image (see
+	// eventFilter()) -- no Prev/Next buttons, no position readout, just the list + the image.
+	void refreshPreviewPoseList(); // rescans preview_identity_folder_ for numbered pose subfolders, tries to keep the current selection
+	void refreshPreviewPoseListIfVisible(); // same, but only if preview_stack_ is currently showing the browse page -- called after each pose capture and after each calibration run so it doesn't do pointless work while the live page is showing
+	void loadPreviewPoseAt(int row); // loads phase36.bmp for preview_pose_labels_[row] into the big image and updates list selection
+	QStackedWidget* preview_stack_ = nullptr;
+	QListWidget* preview_pose_list_ = nullptr;
+	QLabel* preview_window_image_label_ = nullptr; // name kept from the old popup-window design -- it's page 1 of preview_stack_ now, not a separate window
+	QPushButton* preview_refresh_btn_ = nullptr;
+	QPushButton* btn_browse_poses_ = nullptr; // toggles preview_stack_ between live view and pose browse view
+	QString preview_identity_folder_; // identity folder the list was last scanned from
+	QStringList preview_pose_labels_; // sorted pose folder names currently listed, e.g. "00","01",...
+	int preview_current_row_ = -1; // index into preview_pose_labels_ currently displayed, -1 if none
+	QImage preview_current_image_; // kept so eventFilter() can rescale it live when the label is resized
+	QSet<QString> recaptured_poses_; // pose labels (re)captured since the last calibration run -- shown with a "✓" in the list, cleared on the next calibrate
+
+	// Busy indicator: matches ScanToolWindow's updateBusyIndicator() format exactly --
+	//   - Console: a classic \r-overwritten |/-\ spinner, tagged with the same bracketed
+	//     prefix as the messages around it (e.g. "[calib] working"), colored bright cyan.
+	//   - GUI (log_view_, the terminal-styled status box -- our equivalent of ScanToolWindow's
+	//     label_status_): a single block character (U+2588) bouncing back and forth across a
+	//     12-char '.'-filled track, e.g. "[calib] working  [..#.......]", overwriting log_view_
+	//     live.
+	// prefix should be a bracketed tag matching the operation, e.g. "[calib] working" /
+	// "[write] working", same convention ScanToolWindow uses ("[calib] ...", "[connect] ...").
+	void startBusyHeartbeat(const QString& prefix);
 	void stopBusyHeartbeat();
 	QTimer busy_heartbeat_timer_;
-	int spinner_index_ = 0;
-	QLabel* busy_label_ = nullptr;
+	int busy_spinner_index_ = 0;
 	QString busy_prefix_;
 
 	void setConnectedUiState(bool connected);
 	void connectThreadFunc(QString ip);
 	void applyExposureRangeForProjector(); // sets spin_exposure_'s range based on projector_version_ -- see .cpp for the real 3010/4710 bounds, confirmed from camera_capture_gui.cpp's setCameraConfigParam()
-	void logCurrentParamsInto(const QString& context, QStringList& lines_out); // reads LED/exposure/gain straight from the camera and appends log lines to lines_out -- doesn't touch the GUI directly, so it's safe to call from a background thread
+
+	// Reads LED/exposure/gain straight from the camera and writes an English readback line
+	// (plus a [WARN] line per failed read) straight to the console via logConsoleOnly() --
+	// doesn't touch the GUI, so it's safe to call from a background thread. `context` is a
+	// short English tag identifying when this readback happened, e.g. "post-connect".
+	void logCurrentParamsInto(const QString& context);
 
 	// Runs continuously on a background thread while capturing_ is true: blocking-captures
 	// one grayscale frame, emits captureFinished, then immediately captures the next one. No
@@ -166,7 +274,7 @@ private:
 	// auto-resumes continuous capture if it was running before. Loads back phase36.bmp (the
 	// confirmed preview frame index, from main_xema_color.py's own loadImage()) afterward
 	// just to show on screen -- no detection/annotation on it anymore.
-	void captureForCalibThreadFunc(QString ip, QString save_folder, int led, float gain, float exposure);
+	void captureForCalibThreadFunc(QString ip, QString save_folder, QString pose_label, int led, float gain, float exposure);
 
 	// "Calibrate" -- runs calibration.exe against every numbered pose folder saved so far,
 	// exactly matching main_xema_color.py's calibrate():
@@ -200,7 +308,24 @@ private:
 	// (0xC0000135 / exit code -1073741515), a lesson from the earlier scan tool.
 	int runExeBlocking(const QString& program, const QStringList& args, QString& out_output, int timeout_ms = 60000);
 
-	QImage grayToQImage(const cv::Mat& gray); // no more BGR overlay conversion needed -- board/overexposure marking is gone
+	QImage grayToQImage(const cv::Mat& gray);
+	QImage colorToQImage(const cv::Mat& bgr); // for this tool's own live-preview overlay (annotateLiveFrame) -- color-annotated (BGR) images, unlike the plain grayscale phase36.bmp/board captures
+
+	// Always-on live overlay, applied to every frame in captureLoopThreadFunc -- not a toggle,
+	// not on-demand:
+	//   - Overexposure: marks any pixel >= 254 red. 254 matches the firmware's own threshold
+	//     (configure_auto_exposure.cpp's evaluateBrightnessParam: cv::threshold(img,
+	//     over_exposure_mask, 254, 255, ...)), not the same as fully-saturated 255.
+	//   - Board detection: draws the calibration board's detected points in green if found,
+	//     using the SAME algorithm calibration.exe's own Calibrate_Function::
+	//     findCircleBoardFeature() uses (confirmed independently in calibrate_function.cpp,
+	//     precision_test.cpp, and configure_standard_plane.cpp: invert the image,
+	//     cv::findCirclesGrid with CALIB_CB_ASYMMETRIC_GRID | CALIB_CB_CLUSTERING, board size
+	//     7x11 -- constant across all spacings per precision_test.cpp's getBoard()).
+	// Runs on every live frame, so it's real-time feedback while adjusting exposure/gain and
+	// positioning the board -- not a per-frame log line (that would flood the console).
+	QImage annotateLiveFrame(const cv::Mat& gray);
+
 	void loadConfig();
 	void saveConfig();
 
@@ -232,11 +357,17 @@ private:
 	QPushButton* btn_apply_params_;
 
 	QPushButton* btn_capture_; // toggles continuous capture on/off
+	// "起始姿态编号" -- which pose slot "拍照（用于标定）" saves into next, same mechanism as
+	// ScanToolWindow's combo_group_: onCaptureForCalibClicked reads currentIndex() directly as
+	// the pose number (item text IS the zero-padded index, so index and folder name always
+	// agree), and a successful capture advances it by one afterward (capped at the last item),
+	// exactly like ScanToolWindow::onShotClicked. Picking an earlier number here and capturing
+	// is how you deliberately overwrite/recapture a specific pose (e.g. one that came back grey
+	// after a calibration run) instead of only ever appending new ones.
+	QComboBox* combo_start_pose_;
 	QPushButton* btn_capture_calib_; // stops continuous capture (if running), takes one deliberate frame, saves it as a numbered calib pose
 	QPushButton* btn_calibrate_; // runs calibration.exe against all saved poses -- see calibrateThreadFunc comment
-	QLabel* label_calib_status_;
 	QPushButton* btn_write_params_; // writes param.txt to the camera -- see writeParamsThreadFunc comment
-	QLabel* label_write_status_;
 	QLabel* label_image_;
 	QLabel* log_view_; // single-line status bar, like the earlier scan tool's label_status_ -- brief info only, elided if too long
 
@@ -261,5 +392,4 @@ private:
 	int height_ = 0;
 	int projector_version_ = 0; // 3010 or 4710, from DfGetProjectorVersion -- determines the real exposure range
 	int pixel_type_ = 0; // 0=Mono, 1=BayerRG8 (XemaPixelType), from DfGetCameraPixelType -- diagnostic only, logged on connect
-	int calib_pose_index_ = 0; // increments each successful "capture for calib" this session -- not persisted, resets on reconnect
 };
