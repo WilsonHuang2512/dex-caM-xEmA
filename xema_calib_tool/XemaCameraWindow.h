@@ -20,6 +20,7 @@
 #include <QStackedWidget>
 #include <QListWidget>
 #include <QComboBox>
+#include <QTabWidget>
 #include <QSet>
 #include <QMouseEvent>
 #include <atomic>
@@ -68,6 +69,16 @@ enum class XemaBoardSpacingMm
 	Spacing20 = 20,
 	Spacing40 = 40,
 	Spacing80 = 80,
+};
+
+// Which calibration.exe --use variant to run. Capture (--get-raw-02) is identical either
+// way -- confirmed from XEMA-master/calibration/calibration.cpp: "patterns" routes to
+// calibrate_stereo() (mono board detection), "patterns-c" routes to
+// calibrate_stereo_color() (color board detection). Only the calibrate step differs.
+enum class XemaCalibMode
+{
+    Color, // --use patterns-c
+    Mono,  // --use patterns
 };
 
 // Console log levels. Replaces the old approach of grepping the message text for Chinese
@@ -120,6 +131,10 @@ signals:
 	void calibCaptureFinished(bool ok, QString guiMsg, QString consoleMsg, QImage image, QString poseLabel);
 	void calibrateFinished(QString guiMsg, QString consoleMsg, bool ok);
 	void writeParamsFinished(QString guiMsg, QString consoleMsg, bool ok);
+	// "较正" (correct) -- refines an already-existing param.txt using a fresh
+	// open_cam3d.exe --get-calib-param readback + calibration.exe --correct pass. See
+	// correctThreadFunc for the full sequence.
+	void correctFinished(QString guiMsg, QString consoleMsg, bool ok);
 
 private slots:
 	void onConnectClicked();
@@ -131,12 +146,15 @@ private slots:
 	void onApplyParamsFinished(QString guiMsg, QString consoleMsg, bool warned);
 	void onDisconnectFinished(QString guiMsg, QString consoleMsg, bool warned);
 	void onBoardSpacingChanged();
+	void onCalibModeChanged();
 	void onCaptureForCalibClicked();
 	void onCalibCaptureFinished(bool ok, QString guiMsg, QString consoleMsg, QImage image, QString poseLabel);
 	void onCalibrateClicked();
 	void onCalibrateFinished(QString guiMsg, QString consoleMsg, bool ok);
 	void onWriteParamsClicked();
 	void onWriteParamsFinished(QString guiMsg, QString consoleMsg, bool ok);
+	void onCorrectClicked();
+	void onCorrectFinished(QString guiMsg, QString consoleMsg, bool ok);
 	void onBrowseSavePathClicked();
 	void onBusyHeartbeat();
 	void onBrowsePosesClicked(); // toggles preview_stack_ between live view and pose browse view (was "open a window" -- now a same-window toggle)
@@ -183,8 +201,10 @@ private:
 	// Prints calibration.exe's raw stdout in FULL (nothing hidden -- scroll up in the console
 	// for line-by-line detail), then a bolded summary block underneath pulling out just the
 	// lines that matter (board image count, reprojection error, pass/fail; repeated "found"
-	// lines collapsed into one count) so the takeaway is visible without scrolling.
-	void logCalibExeOutput(const QString& raw_output);
+	// lines collapsed into one count) so the takeaway is visible without scrolling. `tag`
+	// labels the bracketed section headers ("[calib]" by default, "[correct]" when called from
+	// correctThreadFunc) -- both --calibrate and --correct share the same stdout format.
+	void logCalibExeOutput(const QString& raw_output, const QString& tag = "calib");
 
 	// calibration.exe's stdout never names WHICH pose failed board detection ("found" is
 	// printed with no pose number attached) -- but it writes "<N>_board.bmp" for every pose it
@@ -195,7 +215,8 @@ private:
 	// numbers (zero-padded to match the capture folder naming, e.g. "07"), or a highlighted
 	// [INFO] confirming all poses were detected if none are missing. Called as part of the
 	// same summary block logCalibExeOutput prints, so it's the last thing before the result.
-	void logMissingBoardPoses(const QString& identity_folder);
+	// `tag` matches whatever logCalibExeOutput was called with for the same run.
+	void logMissingBoardPoses(const QString& identity_folder, const QString& tag = "calib");
 
 	// Pose browsing lives in the SAME area as the live capture preview now (not a separate
 	// window) -- preview_stack_ is a QStackedWidget with two pages: page 0 is label_image_
@@ -308,8 +329,9 @@ private:
 	void captureForCalibThreadFunc(QString ip, QString save_folder, QString pose_label, int led, float gain, float exposure);
 
 	// "Calibrate" -- runs calibration.exe against every numbered pose folder saved so far,
-	// exactly matching main_xema_color.py's calibrate():
-	//   calibration.exe --calibrate --use patterns-c --path <identity_folder>/
+	// matching main_xema_color.py's calibrate(), except --use is now selectable instead of
+	// hardcoded:
+	//   calibration.exe --calibrate --use <patterns|patterns-c> --path <identity_folder>/
 	//     --version <3010|4710> --board <spacing_mm> --calib <identity_folder>/param.txt
 	// calibration.exe itself scans the bare-numbered subfolders (00, 01, ...) under
 	// --path for pose data -- it does its own multi-pose discovery, we don't enumerate
@@ -319,7 +341,7 @@ private:
 	// a calibration run. --version uses the auto-detected projector_version_ (from
 	// DfGetProjectorVersion at connect) rather than a manual selector, since we already know
 	// it and a mismatched manual pick would silently produce a wrong calibration.
-	void calibrateThreadFunc(QString identity_folder, int projector_version, int board_spacing_mm);
+	void calibrateThreadFunc(QString identity_folder, int projector_version, int board_spacing_mm, XemaCalibMode calib_mode);
 
 	// "Write params" -- runs open_cam3d.exe --set-calib-looktable --ip <ip> --path
 	// <identity_folder>/param.txt, exactly matching main_xema_color.py's writeparam().
@@ -330,6 +352,22 @@ private:
 	// commented-out automatic SSH reboot after writing; that's left disabled here too,
 	// matching the currently-active python behavior -- add it only if explicitly asked for.
 	void writeParamsThreadFunc(QString ip, QString calib_path, int led, float gain, float exposure);
+
+	// "较正" (Correct) -- refines an EXISTING param.txt using new capture patterns, instead of
+	// calibrating one from scratch. Matches main_xema_correct_color.py's calibrate() (its
+	// button is labeled "标定" in that tool but it's really a correction pass, not a fresh
+	// calibrate -- confirmed from its command: calibration.exe --correct, not --calibrate):
+	//   1. open_cam3d.exe --get-calib-param --ip <ip> --path <param_in_path> -- fetches the
+	//      parameters CURRENTLY on the camera into a staging file (same one-client-at-a-time
+	//      situation as --get-raw-02/--set-calib-looktable, so this also needs the
+	//      disconnect/run/reconnect dance).
+	//   2. calibration.exe --correct --use <patterns|patterns-c> --path <identity_folder>/
+	//      --version <3010|4710> --board <spacing_mm> --param-in <param_in_path>
+	//      --param-out <identity_folder>/param.txt -- reads the same captured pose patterns
+	//      Calibrate would use, but refines the fetched params instead of computing fresh
+	//      ones. This half is pure file-based computation (no camera needed), so it runs
+	//      AFTER reconnecting/resuming, unlike step 1.
+	void correctThreadFunc(QString ip, QString identity_folder, int projector_version, int board_spacing_mm, XemaCalibMode calib_mode, int led, float gain, float exposure);
 
 	// Runs an external command to completion (blocking, with a timeout), returning its exit
 	// code and capturing its combined stdout+stderr into out_output. Working directory is
@@ -399,6 +437,7 @@ private:
 	QPushButton* btn_capture_calib_; // stops continuous capture (if running), takes one deliberate frame, saves it as a numbered calib pose
 	QPushButton* btn_calibrate_; // runs calibration.exe against all saved poses -- see calibrateThreadFunc comment
 	QPushButton* btn_write_params_; // writes param.txt to the camera -- see writeParamsThreadFunc comment
+	QPushButton* btn_correct_ = nullptr; // refines an existing param.txt using new patterns -- see correctThreadFunc comment
 	QLabel* label_image_;
 	QLabel* log_view_; // single-line status bar, like the earlier scan tool's label_status_ -- brief info only, elided if too long
 
@@ -410,6 +449,11 @@ private:
 	QRadioButton* radio_spacing_80_;
 	XemaBoardSpacingMm board_spacing_ = XemaBoardSpacingMm::Spacing80;
 
+	QButtonGroup* group_calib_mode_ = nullptr;
+	QRadioButton* radio_calib_color_ = nullptr;
+	QRadioButton* radio_calib_mono_ = nullptr;
+	XemaCalibMode calib_mode_ = XemaCalibMode::Color; // matches current hardcoded behavior as default
+
 	// State
 	bool connected_ = false;
 	std::atomic<bool> busy_{ false };               // true while connecting (guards against overlapping connect attempts)
@@ -419,6 +463,7 @@ private:
 	std::atomic<bool> calib_capturing_{ false };     // guards against overlapping "Capture for calib" clicks
 	std::atomic<bool> calibrating_{ false };         // guards against overlapping "Calibrate" clicks
 	std::atomic<bool> writing_params_{ false };      // guards against overlapping "Write params" clicks
+	std::atomic<bool> correcting_{ false };          // guards against overlapping "Correct" clicks
 	int width_ = 0;
 	int height_ = 0;
 	int projector_version_ = 0;

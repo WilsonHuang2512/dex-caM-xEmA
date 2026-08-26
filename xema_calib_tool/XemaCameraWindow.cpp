@@ -47,7 +47,14 @@ static const char* kWin98Style =
 	"QComboBox QAbstractItemView { background-color: #ffffff; color: #000000;"
 	"  selection-background-color: #000080; selection-color: #ffffff; border: 1px solid #808080; outline: 0; }"
 	"QGroupBox { border: 2px groove #808080; margin-top: 10px; padding-top: 6px; font-weight: bold; }"
-	"QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }";
+	"QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+	"QTabWidget::pane { border-style: outset; border-width: 2px;"
+	"  border-color: #ffffff #808080 #808080 #ffffff; top: -2px; background-color: #c0c0c0; }"
+	"QTabBar::tab { background-color: #c0c0c0; border-style: outset; border-width: 2px;"
+	"  border-color: #ffffff #808080 #000000 #ffffff; padding: 5px 14px; margin-right: 2px; }"
+	"QTabBar::tab:selected { border-color: #ffffff #808080 #c0c0c0 #ffffff; margin-bottom: -2px; padding-bottom: 7px; }"
+	"QTabBar::tab:!selected { margin-top: 2px; }"
+	"QTabBar::tab:disabled { color: #808080; }";
 
 static const char* kTerminalLogStyle =
 	"background-color: #000000; color: #33ff66; border-style: inset; border-width: 2px;"
@@ -153,6 +160,21 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	board_row->addWidget(radio_spacing_40_);
 	board_row->addWidget(radio_spacing_80_);
 
+	// ---- calib mode: color sensor vs black/white sensor (calibration.exe's --use argument) ----
+	// Capture (--get-raw-02) is identical either way -- only the calibrate step's --use flag
+	// changes ("patterns-c" for color, "patterns" for mono). See XemaCalibMode in the header.
+	group_calib_mode_ = new QButtonGroup(this);
+	radio_calib_color_ = new QRadioButton(u8"彩色", this);
+	radio_calib_mono_ = new QRadioButton(u8"黑白", this);
+	group_calib_mode_->addButton(radio_calib_color_);
+	group_calib_mode_->addButton(radio_calib_mono_);
+	radio_calib_color_->setChecked(true); // matches the previously-hardcoded "patterns-c" default
+
+	QGroupBox* calib_mode_box = new QGroupBox(u8"标定模式", this);
+	QHBoxLayout* calib_mode_row = new QHBoxLayout(calib_mode_box);
+	calib_mode_row->addWidget(radio_calib_color_);
+	calib_mode_row->addWidget(radio_calib_mono_);
+
 	// ---- capture ----
 	btn_capture_ = new QPushButton(u8"开始连续采集", this);
 	btn_capture_->setEnabled(false);
@@ -189,14 +211,33 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	btn_calibrate_->setEnabled(true); // no camera connection needed
 	btn_calibrate_->setToolTip(u8"对已拍摄的标定姿态运行 calibration.exe，不需要相机连接");
 
+	btn_correct_ = new QPushButton(u8"较正", this);
+	btn_correct_->setEnabled(true); // runs independently like Calibrate -- connects only as needed for the get-calib-param step, see correctThreadFunc
+	btn_correct_->setToolTip(u8"用新拍摄的姿态较正已有的 param.txt（calibration.exe --correct）；需要相机IP以下载当前参数，不要求本次会话已连接");
+
 	btn_write_params_ = new QPushButton(u8"写参数", this);
 	btn_write_params_->setEnabled(false); // needs a live connection, like capture-for-calib
-	btn_write_params_->setToolTip(u8"将标定结果 (param.txt) 写入相机 -- 需要先成功运行标定");
+	btn_write_params_->setToolTip(u8"将标定结果 (param.txt) 写入相机 -- 需要先成功运行标定或较正");
 
-	QHBoxLayout* calibrate_row = new QHBoxLayout();
-	calibrate_row->addWidget(btn_calibrate_);
-	calibrate_row->addWidget(btn_write_params_);
-	calibrate_row->addStretch();
+	// Calibrate (from-scratch) and Correct (refine existing param.txt) are two different modes
+	// of the same underlying calibration.exe, not two steps of one workflow -- putting each in
+	// its own tab (matching ScanToolWindow's mode_tabs) makes that distinction visible instead
+	// of showing both buttons side by side as if you'd normally click both.
+	QWidget* tab_calibrate_page = new QWidget(this);
+	QHBoxLayout* tab_calibrate_layout = new QHBoxLayout(tab_calibrate_page);
+	tab_calibrate_layout->setContentsMargins(6, 6, 6, 6);
+	tab_calibrate_layout->addWidget(btn_calibrate_);
+	tab_calibrate_layout->addStretch(1);
+
+	QWidget* tab_correct_page = new QWidget(this);
+	QHBoxLayout* tab_correct_layout = new QHBoxLayout(tab_correct_page);
+	tab_correct_layout->setContentsMargins(6, 6, 6, 6);
+	tab_correct_layout->addWidget(btn_correct_);
+	tab_correct_layout->addStretch(1);
+
+	QTabWidget* mode_tabs = new QTabWidget(this);
+	mode_tabs->addTab(tab_calibrate_page, u8"标定模式");
+	mode_tabs->addTab(tab_correct_page, u8"较正模式");
 
 	label_image_ = new QLabel(this);
 	label_image_->setMinimumHeight(350);
@@ -253,8 +294,10 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	content_layout->addLayout(identity_row);
 	content_layout->addWidget(param_box);
 	content_layout->addWidget(board_box);
+	content_layout->addWidget(calib_mode_box);
 	content_layout->addLayout(capture_row);
-	content_layout->addLayout(calibrate_row);
+	content_layout->addWidget(mode_tabs);
+	content_layout->addWidget(btn_write_params_);
 	content_layout->addWidget(preview_stack_, 1);
 	content_layout->addWidget(log_view_);
 	main_layout->addWidget(content, 1);
@@ -267,8 +310,10 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	connect(btn_browse_poses_, &QPushButton::clicked, this, &XemaCameraWindow::onBrowsePosesClicked);
 	connect(btn_calibrate_, &QPushButton::clicked, this, &XemaCameraWindow::onCalibrateClicked);
 	connect(btn_write_params_, &QPushButton::clicked, this, &XemaCameraWindow::onWriteParamsClicked);
+	connect(btn_correct_, &QPushButton::clicked, this, &XemaCameraWindow::onCorrectClicked);
 	connect(btn_browse_save_path_, &QPushButton::clicked, this, &XemaCameraWindow::onBrowseSavePathClicked);
 	connect(group_board_spacing_, QOverload<QAbstractButton*>::of(&QButtonGroup::buttonClicked), this, &XemaCameraWindow::onBoardSpacingChanged);
+	connect(group_calib_mode_, QOverload<QAbstractButton*>::of(&QButtonGroup::buttonClicked), this, &XemaCameraWindow::onCalibModeChanged);
 	connect(preview_pose_list_, &QListWidget::currentRowChanged, this, &XemaCameraWindow::onPreviewPoseListRowChanged);
 	connect(preview_refresh_btn_, &QPushButton::clicked, this, &XemaCameraWindow::onPreviewRefreshClicked);
 	connect(this, &XemaCameraWindow::connectFinished, this, &XemaCameraWindow::onConnectFinished);
@@ -278,6 +323,7 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	connect(this, &XemaCameraWindow::calibCaptureFinished, this, &XemaCameraWindow::onCalibCaptureFinished);
 	connect(this, &XemaCameraWindow::calibrateFinished, this, &XemaCameraWindow::onCalibrateFinished);
 	connect(this, &XemaCameraWindow::writeParamsFinished, this, &XemaCameraWindow::onWriteParamsFinished);
+	connect(this, &XemaCameraWindow::correctFinished, this, &XemaCameraWindow::onCorrectFinished);
 	connect(&busy_heartbeat_timer_, &QTimer::timeout, this, &XemaCameraWindow::onBusyHeartbeat);
 
 	loadConfig();
@@ -346,6 +392,19 @@ void XemaCameraWindow::loadConfig()
 	case 40: radio_spacing_40_->setChecked(true); board_spacing_ = XemaBoardSpacingMm::Spacing40; break;
 	default: radio_spacing_80_->setChecked(true); board_spacing_ = XemaBoardSpacingMm::Spacing80; break;
 	}
+
+	// Default "color" if never saved before -- matches the previously-hardcoded "patterns-c" behavior.
+	QString calib_mode_str = obj.value("calib_mode").toString("color");
+	if (calib_mode_str == "mono")
+	{
+		radio_calib_mono_->setChecked(true);
+		calib_mode_ = XemaCalibMode::Mono;
+	}
+	else
+	{
+		radio_calib_color_->setChecked(true);
+		calib_mode_ = XemaCalibMode::Color;
+	}
 }
 
 void XemaCameraWindow::saveConfig()
@@ -360,6 +419,7 @@ void XemaCameraWindow::saveConfig()
 	obj["identity"] = edit_identity_->text();
 	obj["save_path"] = edit_save_path_->text();
 	obj["projector_version"] = projector_version_;
+	obj["calib_mode"] = (calib_mode_ == XemaCalibMode::Mono) ? "mono" : "color";
 
 	QFile f(path);
 	if (f.open(QIODevice::WriteOnly))
@@ -380,6 +440,16 @@ void XemaCameraWindow::onBoardSpacingChanged()
 	log(XemaLogLevel::Info,
 		QString(u8"标定板间距: %1mm").arg((int)board_spacing_),
 		QString("Board spacing set to %1 mm").arg((int)board_spacing_));
+	saveConfig();
+}
+
+void XemaCameraWindow::onCalibModeChanged()
+{
+	calib_mode_ = radio_calib_mono_->isChecked() ? XemaCalibMode::Mono : XemaCalibMode::Color;
+
+	log(XemaLogLevel::Info,
+		calib_mode_ == XemaCalibMode::Mono ? u8"标定模式: 黑白" : u8"标定模式: 彩色",
+		QString("Calibration mode set to %1").arg(calib_mode_ == XemaCalibMode::Mono ? "mono (--use patterns)" : "color (--use patterns-c)"));
 	saveConfig();
 }
 
@@ -821,14 +891,14 @@ void XemaCameraWindow::logCurrentParamsInto(const QString& context)
 // Structural lines ("Start Read Board Images......", "Start Find Board......") and the
 // redundant "Calibrate Finished!" (we already report our own pass/fail line) are dropped from
 // the summary -- they're still in the full dump above if needed.
-void XemaCameraWindow::logCalibExeOutput(const QString& raw_output)
+void XemaCameraWindow::logCalibExeOutput(const QString& raw_output, const QString& tag)
 {
 	if (raw_output.isEmpty())
 	{
 		return;
 	}
 
-	logConsoleOnly(XemaLogLevel::Exec, "========== [calib] output ==========", true);
+	logConsoleOnly(XemaLogLevel::Exec, QString("========== [%1] output ==========").arg(tag), true);
 	logConsoleOnly(XemaLogLevel::Info, raw_output); // full, unfiltered, passed through as-is
 	logConsoleOnly(XemaLogLevel::Exec, "========== end output ==========", true);
 
@@ -890,7 +960,7 @@ void XemaCameraWindow::logCalibExeOutput(const QString& raw_output)
 		// Finished!") is intentionally left out of the summary -- see function comment.
 	}
 
-	logConsoleOnly(XemaLogLevel::Exec, "========== [calib] summary ==========", true);
+	logConsoleOnly(XemaLogLevel::Exec, QString("========== [%1] summary ==========").arg(tag), true);
 
 	bool have_summary_line = false;
 
@@ -926,7 +996,7 @@ void XemaCameraWindow::logCalibExeOutput(const QString& raw_output)
 
 	if (!have_summary_line)
 	{
-		logConsoleOnly(XemaLogLevel::Warn, "[calib] no recognizable summary lines in output -- see full output above", true);
+		logConsoleOnly(XemaLogLevel::Warn, QString("[%1] no recognizable summary lines in output -- see full output above").arg(tag), true);
 	}
 }
 
@@ -934,7 +1004,7 @@ void XemaCameraWindow::logCalibExeOutput(const QString& raw_output)
 // "<N>_draw.bmp" only for poses where the board was actually found. Diffing the two gives the
 // exact list of poses to recapture, since calibration.exe's own stdout never names them. This
 // is logged as the last line of the "[calib] summary" block logCalibExeOutput just printed.
-void XemaCameraWindow::logMissingBoardPoses(const QString& identity_folder)
+void XemaCameraWindow::logMissingBoardPoses(const QString& identity_folder, const QString& tag)
 {
 	QDir dir(identity_folder);
 	QStringList board_files = dir.entryList(QStringList() << "*_board.bmp", QDir::Files);
@@ -975,13 +1045,13 @@ void XemaCameraWindow::logMissingBoardPoses(const QString& identity_folder)
 	if (!missing.isEmpty())
 	{
 		logConsoleOnly(XemaLogLevel::Warn,
-			QString("[calib] board NOT detected in pose(s): %1 -- recapture these and re-run calibration").arg(missing.join(", ")),
+			QString("[%1] board NOT detected in pose(s): %2 -- recapture these and re-run calibration").arg(tag, missing.join(", ")),
 			true);
 	}
 	else
 	{
 		logConsoleOnly(XemaLogLevel::Info,
-			QString("[calib] board detected in all %1 pose(s)").arg(pose_indices.size()),
+			QString("[%1] board detected in all %2 pose(s)").arg(tag).arg(pose_indices.size()),
 			true);
 	}
 
@@ -1550,6 +1620,12 @@ void XemaCameraWindow::onCaptureForCalibClicked()
 		return;
 	}
 
+	if (correcting_ || writing_params_)
+	{
+		log(XemaLogLevel::Warn, u8"其他操作进行中，请稍候", "Another connection-exclusive operation is already in progress");
+		return;
+	}
+
 	QString ip = edit_ip_->text().trimmed();
 	if (ip.isEmpty())
 	{
@@ -1572,6 +1648,7 @@ void XemaCameraWindow::onCaptureForCalibClicked()
 	btn_capture_->setEnabled(false); // don't let continuous capture toggle while we're mid stop/capture
 	btn_connect_->setEnabled(false);
 	btn_disconnect_->setEnabled(false);
+	btn_correct_->setEnabled(false); // shares the same exclusive-connection resource as this
 
 	std::thread t(&XemaCameraWindow::captureForCalibThreadFunc, this, ip, save_folder, pose_label, led, gain, exposure);
 	t.detach();
@@ -1743,6 +1820,7 @@ void XemaCameraWindow::onCalibCaptureFinished(bool ok, QString guiMsg, QString c
 
 	calib_capturing_ = false;
 	setConnectedUiState(connected_);
+	btn_correct_->setEnabled(true); // no longer gated by setConnectedUiState -- runs independently, like Calibrate
 	if (connected_)
 	{
 		label_firmware_->setText(QString(u8"固件版本: %1").arg(firmware_version_));
@@ -1788,15 +1866,16 @@ void XemaCameraWindow::onCalibrateClicked()
 	logConsoleOnly(XemaLogLevel::Info, "[calib] starting");
 	startBusyHeartbeat("[calib] working");
 
-	std::thread t(&XemaCameraWindow::calibrateThreadFunc, this, identity_folder, projector_version_, (int)board_spacing_);
+	std::thread t(&XemaCameraWindow::calibrateThreadFunc, this, identity_folder, projector_version_, (int)board_spacing_, calib_mode_);
 	t.detach();
 }
 
-void XemaCameraWindow::calibrateThreadFunc(QString identity_folder, int projector_version, int board_spacing_mm)
+void XemaCameraWindow::calibrateThreadFunc(QString identity_folder, int projector_version, int board_spacing_mm, XemaCalibMode calib_mode)
 {
-	// Matches main_xema_color.py's calibrate() exactly:
-	//   calibration.exe --calibrate --use patterns-c --path <identity>/ --version <projector>
-	//     --board <spacing> --calib <identity>/param.txt
+	// Matches main_xema_color.py's calibrate(), except --use is now picked from the UI
+	// instead of hardcoded:
+	//   calibration.exe --calibrate --use <patterns|patterns-c> --path <identity>/
+	//     --version <projector> --board <spacing> --calib <identity>/param.txt
 	QString calib_path = identity_folder + "/param.txt";
 
 	// Delete any stale param.txt from a previous run first -- this exe's exit code isn't a
@@ -1808,8 +1887,10 @@ void XemaCameraWindow::calibrateThreadFunc(QString identity_folder, int projecto
 		QFile::remove(calib_path);
 	}
 
+	QString use_arg = (calib_mode == XemaCalibMode::Mono) ? "patterns" : "patterns-c";
+
 	QStringList args;
-	args << "--calibrate" << "--use" << "patterns-c"
+	args << "--calibrate" << "--use" << use_arg
 		<< "--path" << QDir::toNativeSeparators(identity_folder + "/")
 		<< "--version" << QString::number(projector_version)
 		<< "--board" << QString::number(board_spacing_mm)
@@ -1863,6 +1944,12 @@ void XemaCameraWindow::onWriteParamsClicked()
 		return;
 	}
 
+	if (correcting_ || calib_capturing_)
+	{
+		log(XemaLogLevel::Warn, u8"其他操作进行中，请稍候", "Another connection-exclusive operation is already in progress");
+		return;
+	}
+
 	QString ip = edit_ip_->text().trimmed();
 	if (ip.isEmpty())
 	{
@@ -1885,6 +1972,7 @@ void XemaCameraWindow::onWriteParamsClicked()
 
 	writing_params_ = true;
 	btn_write_params_->setEnabled(false);
+	btn_correct_->setEnabled(false);
 	btn_capture_calib_->setEnabled(false);
 	btn_capture_->setEnabled(false);
 	btn_connect_->setEnabled(false);
@@ -1989,9 +2077,249 @@ void XemaCameraWindow::onWriteParamsFinished(QString guiMsg, QString consoleMsg,
 
 	writing_params_ = false;
 	setConnectedUiState(connected_);
+	btn_correct_->setEnabled(true); // no longer gated by setConnectedUiState -- runs independently, like Calibrate
 	if (connected_)
 	{
 		label_firmware_->setText(QString(u8"固件版本: %1").arg(firmware_version_));
 	}
 	btn_capture_->setText(capturing_ ? u8"停止采集" : u8"开始连续采集");
+}
+
+// ==================== correct ====================
+
+void XemaCameraWindow::onCorrectClicked()
+{
+	if (correcting_)
+	{
+		log(XemaLogLevel::Warn, u8"较正进行中，请稍候", "Correction already in progress");
+		return;
+	}
+
+	// These share the same exclusive-connection resource (disconnect/run-exe/reconnect) --
+	// their buttons are already disabled while running, but the button state alone isn't a
+	// reliable lock across threads, so check the flags directly too.
+	if (calib_capturing_ || writing_params_)
+	{
+		log(XemaLogLevel::Warn, u8"其他操作进行中，请稍候", "Another connection-exclusive operation is already in progress");
+		return;
+	}
+
+	QString ip = edit_ip_->text().trimmed();
+	if (ip.isEmpty())
+	{
+		log(XemaLogLevel::Warn, u8"请输入相机IP", "Camera IP is required");
+		return;
+	}
+
+	// --correct reads the same captured pose patterns Calibrate would (phase00..36.bmp under
+	// each numbered pose folder), so it needs the identity folder to already have poses in it,
+	// exactly like onCalibrateClicked's precondition.
+	QString identity_folder = currentIdentityFolder();
+	if (!QDir(identity_folder).exists())
+	{
+		log(XemaLogLevel::Warn,
+			QString(u8"未找到姿态目录: %1").arg(identity_folder),
+			QString("Pose folder not found: %1 -- capture at least a few poses first").arg(identity_folder));
+		return;
+	}
+
+	if (projector_version_ != 3010 && projector_version_ != 4710)
+	{
+		log(XemaLogLevel::Warn,
+			u8"光机型号未知，较正可能失败",
+			QString("Projector model unknown (currently %1) -- connect to the camera at least once so the correct --version is known").arg(projector_version_));
+	}
+
+	int led = spin_led_->value();
+	float gain = (float)spin_gain_->value();
+	float exposure = (float)spin_exposure_->value();
+
+	correcting_ = true;
+	btn_correct_->setEnabled(false);
+	btn_write_params_->setEnabled(false); // shares the same exclusive-connection resource as this
+	btn_capture_calib_->setEnabled(false);
+	btn_capture_->setEnabled(false);
+	btn_connect_->setEnabled(false);
+	btn_disconnect_->setEnabled(false);
+	logConsoleOnly(XemaLogLevel::Info, "[correct] starting");
+	startBusyHeartbeat("[correct] working");
+
+	std::thread t(&XemaCameraWindow::correctThreadFunc, this, ip, identity_folder, projector_version_, (int)board_spacing_, calib_mode_, led, gain, exposure);
+	t.detach();
+}
+
+void XemaCameraWindow::correctThreadFunc(QString ip, QString identity_folder, int projector_version, int board_spacing_mm, XemaCalibMode calib_mode, int led, float gain, float exposure)
+{
+	bool was_capturing = capturing_;
+	bool was_connected = connected_; // Correct runs standalone like Calibrate -- only touch the
+	                                  // connection at all if one already existed to step aside for
+
+	if (was_capturing)
+	{
+		logConsoleOnly(XemaLogLevel::Info, "Stopping continuous capture to fetch calibration parameters...");
+		capturing_ = false; // request stop
+
+		QElapsedTimer wait_timer;
+		wait_timer.start();
+		while (capture_thread_active_ && wait_timer.elapsed() < kCaptureStopTimeoutMs)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		}
+
+		if (capture_thread_active_)
+		{
+			logConsoleOnly(XemaLogLevel::Warn,
+				QString("Timed out waiting for capture to stop (%1 ms); proceeding with correction anyway").arg(kCaptureStopTimeoutMs));
+		}
+	}
+
+	// open_cam3d.exe --get-calib-param opens its OWN connection to the camera -- same
+	// one-client-at-a-time situation as --get-raw-02/--set-calib-looktable -- so an existing
+	// in-process session has to step aside first. If we weren't connected to begin with (this
+	// button can be clicked without ever connecting this session, same as Calibrate), there's
+	// nothing to disconnect -- open_cam3d.exe will make its own fresh connection to --ip.
+	if (was_connected)
+	{
+		logConsoleOnly(XemaLogLevel::Info, "Disconnecting in-process session so the external tool can read calibration parameters...");
+		DfDisconnect(ip.toStdString().c_str());
+		connected_ = false;
+	}
+	else
+	{
+		logConsoleOnly(XemaLogLevel::Info, "Not currently connected -- open_cam3d.exe will connect to the camera itself for this step");
+	}
+
+	// Staging file: the parameters CURRENTLY on the camera get fetched here first, then fed to
+	// calibration.exe below as --param-in. A fixed path in the tool's own exe folder, matching
+	// main_xema_correct_color.py's hardcoded "./param.txt" -- deliberately NOT the same file as
+	// the per-identity output (--param-out, identity_folder/param.txt, the same file
+	// Calibrate/Write-params use). Delete any stale copy first -- same reasoning as
+	// param_out_path below: without this, a failed fetch could silently leave a leftover file
+	// from a previous run and this thread would mistake it for a fresh, successful fetch.
+	QString param_in_path = QCoreApplication::applicationDirPath() + "/param.txt";
+	if (QFile::exists(param_in_path))
+	{
+		QFile::remove(param_in_path);
+	}
+
+	QStringList get_param_args;
+	get_param_args << "--get-calib-param" << "--ip" << ip << "--path" << QDir::toNativeSeparators(param_in_path);
+
+	logConsoleOnly(XemaLogLevel::Exec, QString("[correct] running: open_cam3d.exe %1").arg(get_param_args.join(' ')));
+
+	QString get_param_output;
+	int get_param_exit_code = runExeBlocking("open_cam3d.exe", get_param_args, get_param_output, 60000);
+	if (!get_param_output.isEmpty())
+	{
+		logConsoleOnly(XemaLogLevel::Exec, "========== [correct] get-calib-param output ==========", true);
+		logConsoleOnly(XemaLogLevel::Info, get_param_output);
+		logConsoleOnly(XemaLogLevel::Exec, "========== end ==========", true);
+	}
+	logConsoleOnly(get_param_exit_code == 0 ? XemaLogLevel::Info : XemaLogLevel::Warn,
+		QString("[correct] get-calib-param finished (exit code %1)").arg(get_param_exit_code));
+
+	// Only reconnect if we disconnected an existing session above -- if this run started with
+	// no connection, leave it that way rather than silently connecting behind the user's back.
+	if (was_connected)
+	{
+		logConsoleOnly(XemaLogLevel::Info, "Reconnecting...");
+		int reconnect_ret = DfConnect(ip.toStdString().c_str());
+
+		if (reconnect_ret == DF_SUCCESS)
+		{
+			connected_ = true;
+			DfSetCaptureEngine(XemaEngine::Black);
+			DfSetParamLedCurrent(led);
+			DfSetParamCameraExposure(exposure);
+			DfSetParamCameraGain(gain);
+			logConsoleOnly(XemaLogLevel::Info, "Reconnected -- Black engine and current parameters restored");
+		}
+		else
+		{
+			logConsoleOnly(XemaLogLevel::Warn,
+				QString("Reconnect failed: error code %1 -- continuing with the correction step regardless, since calibration.exe --correct doesn't need the camera").arg(reconnect_ret));
+		}
+	}
+
+	// Auto-resumes continuous capture afterward if it was running before (only the
+	// get-calib-param step above needed exclusive camera access -- the --correct step below is
+	// pure file I/O, so it's fine for live preview to be running through it).
+	if (was_capturing && connected_)
+	{
+		capturing_ = true;
+		std::thread resume_t(&XemaCameraWindow::captureLoopThreadFunc, this);
+		resume_t.detach();
+		logConsoleOnly(XemaLogLevel::Info, "Continuous capture automatically resumed");
+	}
+
+	bool got_param_in = QFile::exists(param_in_path);
+	QString gui_msg;
+	QString console_msg;
+	bool ok = false;
+
+	if (!got_param_in)
+	{
+		gui_msg = u8"较正失败，未能获取当前标定参数";
+		console_msg = QString("[correct] aborted -- failed to fetch current calibration parameters from camera (get-calib-param exit code %1)").arg(get_param_exit_code);
+	}
+	else
+	{
+		QString param_out_path = identity_folder + "/param.txt";
+
+		// Same rationale as calibrateThreadFunc: this exe's exit code isn't a reliable success
+		// signal, so delete any stale param.txt first -- a freshly-written-this-run file is the
+		// real evidence of success.
+		if (QFile::exists(param_out_path))
+		{
+			QFile::remove(param_out_path);
+		}
+
+		QString use_arg = (calib_mode == XemaCalibMode::Mono) ? "patterns" : "patterns-c";
+
+		QStringList correct_args;
+		correct_args << "--correct" << "--use" << use_arg
+			<< "--path" << QDir::toNativeSeparators(identity_folder + "/")
+			<< "--version" << QString::number(projector_version)
+			<< "--board" << QString::number(board_spacing_mm)
+			<< "--param-in" << QDir::toNativeSeparators(param_in_path)
+			<< "--param-out" << QDir::toNativeSeparators(param_out_path);
+
+		logConsoleOnly(XemaLogLevel::Exec, QString("[correct] running: calibration.exe %1").arg(correct_args.join(' ')));
+
+		QString correct_output;
+		// Correction re-reads and re-detects the board in every saved pose, same as Calibrate --
+		// same generous timeout.
+		int correct_exit_code = runExeBlocking("calibration.exe", correct_args, correct_output, 600000);
+		logCalibExeOutput(correct_output, "correct"); // full raw dump, then a bolded summary block, tagged [correct] instead of [calib]
+		logMissingBoardPoses(identity_folder, "correct");
+
+		ok = QFile::exists(param_out_path);
+		gui_msg = ok ? u8"较正完成" : u8"较正失败";
+		console_msg = ok
+			? QString("[correct] finished -- %1 written").arg(param_out_path)
+			: QString("[correct] failed -- %1 was not created (exit code %2)").arg(param_out_path).arg(correct_exit_code);
+	}
+
+	emit correctFinished(gui_msg, console_msg, ok);
+}
+
+void XemaCameraWindow::onCorrectFinished(QString guiMsg, QString consoleMsg, bool ok)
+{
+	stopBusyHeartbeat();
+	log(ok ? XemaLogLevel::Success : XemaLogLevel::Error, guiMsg, consoleMsg);
+
+	correcting_ = false;
+	setConnectedUiState(connected_);
+	btn_correct_->setEnabled(true); // no longer gated by setConnectedUiState -- runs independently, like Calibrate
+	if (connected_)
+	{
+		label_firmware_->setText(QString(u8"固件版本: %1").arg(firmware_version_));
+	}
+	btn_capture_->setText(capturing_ ? u8"停止采集" : u8"开始连续采集");
+
+	// param.txt for this identity was just (re)written -- any pose's grey/black verdict shown
+	// in the pose browser is now stale until Calibrate or another Correct run refreshes it.
+	// Mirrors onCalibrateFinished's identical cleanup.
+	recaptured_poses_.clear();
+	refreshPreviewPoseListIfVisible();
 }
