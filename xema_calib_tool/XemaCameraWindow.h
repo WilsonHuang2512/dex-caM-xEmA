@@ -1,5 +1,10 @@
 #pragma once
 
+#include <windows.h>
+#include <cwchar>
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
+
 #include <QWidget>
 #include <QLineEdit>
 #include <QPushButton>
@@ -16,10 +21,13 @@
 #include <QListWidget>
 #include <QComboBox>
 #include <QSet>
+#include <QMouseEvent>
 #include <atomic>
 #include <string>
 #include <vector>
 #include <opencv2/core.hpp>
+
+class QVBoxLayout; // forward declaration -- only used as a pointer parameter (buildTitleBar), no need for the full header here
 
 // Confirmed real API from XEMA-master/sdk/open_cam3d.h, cross-checked against BOTH
 // XEMA-master/cmd/cmd.cpp's get_brightness() AND the real vendor GUI
@@ -91,11 +99,21 @@ public:
 	// staying pinned at whatever size it was when first loaded.
 	bool eventFilter(QObject* watched, QEvent* event) override;
 
+protected:
+	// Custom Win98-style caption bar drag support. The real OS title bar can't be reskinned on
+	// Windows 10/11 once Qt::FramelessWindowHint is set (see buildTitleBar()), so this window
+	// draws its own -- which means it's also responsible for its own drag-to-move, since the
+	// native caption-drag behavior goes away along with the native frame. No manual edge-resize
+	// handling -- window is a fixed frame, drag-move only via the caption bar.
+	void mousePressEvent(QMouseEvent* event) override;
+	void mouseMoveEvent(QMouseEvent* event) override;
+	void mouseReleaseEvent(QMouseEvent* event) override;
+
 signals:
 	// Every "Finished" signal now carries TWO strings for one event: guiMsg is short and in
 	// Chinese (matches the rest of the UI), consoleMsg is the same result phrased as a clean
 	// English sentence for the console. They're deliberately independent -- see log().
-	void connectFinished(bool ok, QString guiMsg, QString consoleMsg);
+	void connectFinished(bool ok, QString guiMsg, QString consoleMsg, QString firmwareVersion);
 	void captureFinished(bool ok, QString guiMsg, QString consoleMsg, QImage image);
 	void applyParamsFinished(QString guiMsg, QString consoleMsg, bool warned);
 	void disconnectFinished(QString guiMsg, QString consoleMsg, bool warned);
@@ -108,7 +126,7 @@ private slots:
 	void onDisconnectClicked();
 	void onApplyParamsClicked();
 	void onCaptureToggled();
-	void onConnectFinished(bool ok, QString guiMsg, QString consoleMsg);
+	void onConnectFinished(bool ok, QString guiMsg, QString consoleMsg, QString firmwareVersion);
 	void onCaptureFinished(bool ok, QString guiMsg, QString consoleMsg, QImage image);
 	void onApplyParamsFinished(QString guiMsg, QString consoleMsg, bool warned);
 	void onDisconnectFinished(QString guiMsg, QString consoleMsg, bool warned);
@@ -140,6 +158,19 @@ private:
 	// log() is only ever called from the GUI thread (mirrors the final result of a user action
 	// into both places); logConsoleOnly() is used for everything in between.
 	void initStatusConsole();
+
+	// Builds the hand-drawn Win98 caption bar (navy gradient, white bold title, Marlett-glyph
+	// min/max/close buttons) and adds it as main_layout's first item, flush to the window edge.
+	// Called once from the constructor, before the rest of the UI is built.
+	void buildTitleBar(QVBoxLayout* main_layout);
+	QWidget* title_bar_ = nullptr;
+	QLabel* title_bar_label_ = nullptr;
+	QPushButton* btn_min_ = nullptr;
+	QPushButton* btn_max_ = nullptr;
+	QPushButton* btn_close_ = nullptr;
+	bool dragging_ = false;
+	QPoint drag_offset_; // mouse pos relative to the window's own top-left, captured once at drag-press time
+
 	static QString levelTag(XemaLogLevel level);   // "[INFO]" / "[WARN]" / "[ERROR]" / "[EXEC]"
 	static QString colorizeForConsole(XemaLogLevel level, const QString& tagged_msg, bool highlight);
 	// highlight=true renders the line bold, for lines worth the reader's eye even in a wall of
@@ -390,6 +421,7 @@ private:
 	std::atomic<bool> writing_params_{ false };      // guards against overlapping "Write params" clicks
 	int width_ = 0;
 	int height_ = 0;
-	int projector_version_ = 0; // 3010 or 4710, from DfGetProjectorVersion -- determines the real exposure range
+	int projector_version_ = 0;
+	QString firmware_version_ = u8"-"; // e.g. "v1.5.5", from DfGetFirmwareVersion at connect time -- reused verbatim on reconnects (calib capture / write params) so the badge never regresses to a placeholder
 	int pixel_type_ = 0; // 0=Mono, 1=BayerRG8 (XemaPixelType), from DfGetCameraPixelType -- diagnostic only, logged on connect
 };

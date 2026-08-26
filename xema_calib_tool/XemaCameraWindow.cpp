@@ -36,9 +36,16 @@ static const char* kWin98Style =
 	"  border-color: #ffffff #808080 #808080 #ffffff; padding: 4px 10px; }"
 	"QPushButton:pressed { border-style: inset; border-color: #808080 #ffffff #ffffff #808080; }"
 	"QPushButton:disabled { color: #808080; }"
-	"QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {"
+	"QLineEdit, QSpinBox, QDoubleSpinBox {"
 	"  background-color: #ffffff; border-style: inset; border-width: 2px;"
 	"  border-color: #808080 #ffffff #ffffff #808080; padding: 2px; }"
+	"QComboBox { background-color: #ffffff; border-style: inset; border-width: 2px;"
+	"  border-color: #808080 #ffffff #ffffff #808080; padding: 2px 2px 2px 4px; }"
+	"QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 16px;"
+	"  border-left: 1px solid #808080; background-color: #c0c0c0; }"
+	"QComboBox::down-arrow { width: 8px; height: 8px; }"
+	"QComboBox QAbstractItemView { background-color: #ffffff; color: #000000;"
+	"  selection-background-color: #000080; selection-color: #ffffff; border: 1px solid #808080; outline: 0; }"
 	"QGroupBox { border: 2px groove #808080; margin-top: 10px; padding-top: 6px; font-weight: bold; }"
 	"QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }";
 
@@ -52,6 +59,11 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 {
 	initStatusConsole();
 
+	// Frameless so the whole window -- including the caption bar -- can be Win98-styled.
+	// Windows 10/11 won't let a stylesheet reach the native title bar, so buildTitleBar()
+	// draws a replacement further down; that also means drag-to-move and min/max/close have
+	// to be reimplemented by hand (see mousePressEvent/mouseMoveEvent/mouseReleaseEvent).
+	setWindowFlags(Qt::FramelessWindowHint);
 	setWindowTitle(u8"XEMA 相机控制");
 	setStyleSheet(kWin98Style);
 	resize(700, 700);
@@ -63,6 +75,7 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	btn_disconnect_ = new QPushButton(u8"断开", this);
 	btn_disconnect_->setEnabled(false);
 	label_firmware_ = new QLabel(u8"固件版本: -", this);
+	label_firmware_->setStyleSheet(kTerminalLogStyle); // same black/green terminal look as log_view_
 
 	QHBoxLayout* connect_row = new QHBoxLayout();
 	connect_row->addWidget(new QLabel(u8"IP:", this));
@@ -153,6 +166,8 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 		combo_start_pose_->addItem(QString("%1").arg(i, 2, 10, QChar('0')));
 	}
 	combo_start_pose_->setToolTip(u8"下一次拍照保存到的姿态编号 -- 选择已有编号即可覆盖重拍那一组");
+	combo_start_pose_->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed); // default Expanding policy was eating the whole row's leftover space, leaving a big gap before "00"
+	combo_start_pose_->setFixedWidth(60); // sizeHint() alone was unreliable once QComboBox got its own QSS rule with drop-down padding -- pin it explicitly instead
 
 	btn_capture_calib_ = new QPushButton(u8"拍照（用于标定）", this);
 	btn_capture_calib_->setEnabled(false);
@@ -227,14 +242,22 @@ XemaCameraWindow::XemaCameraWindow(QWidget* parent)
 	log_view_->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
 	QVBoxLayout* main_layout = new QVBoxLayout(this);
-	main_layout->addLayout(connect_row);
-	main_layout->addLayout(identity_row);
-	main_layout->addWidget(param_box);
-	main_layout->addWidget(board_box);
-	main_layout->addLayout(capture_row);
-	main_layout->addLayout(calibrate_row);
-	main_layout->addWidget(preview_stack_, 1);
-	main_layout->addWidget(log_view_);
+	main_layout->setContentsMargins(0, 0, 0, 0); // title bar must sit flush against the window edge
+	main_layout->setSpacing(0);
+	buildTitleBar(main_layout); // adds title_bar_ as the first item
+
+	QWidget* content = new QWidget(this);
+	QVBoxLayout* content_layout = new QVBoxLayout(content);
+	content_layout->setContentsMargins(9, 9, 9, 9); // restores the margin main_layout used to give everything by default
+	content_layout->addLayout(connect_row);
+	content_layout->addLayout(identity_row);
+	content_layout->addWidget(param_box);
+	content_layout->addWidget(board_box);
+	content_layout->addLayout(capture_row);
+	content_layout->addLayout(calibrate_row);
+	content_layout->addWidget(preview_stack_, 1);
+	content_layout->addWidget(log_view_);
+	main_layout->addWidget(content, 1);
 
 	connect(btn_connect_, &QPushButton::clicked, this, &XemaCameraWindow::onConnectClicked);
 	connect(btn_disconnect_, &QPushButton::clicked, this, &XemaCameraWindow::onDisconnectClicked);
@@ -427,6 +450,103 @@ void XemaCameraWindow::initStatusConsole()
 #endif
 }
 
+// ==================== title bar ====================
+
+// Hand-drawn Win98 caption bar -- the real one can't be reskinned on Windows 10/11 once
+// FramelessWindowHint is set, so this rebuilds it: navy gradient bar, white bold caption text,
+// and three 18x16 outset buttons using Marlett (Windows' built-in caption-glyph font -- '0'
+// minimize, '1' maximize, '2' restore, 'r' close) so the icons look like real Win98 glyphs
+// instead of approximated unicode symbols. If Marlett isn't installed the buttons just show
+// the literal character instead of the glyph -- ugly but not broken.
+void XemaCameraWindow::buildTitleBar(QVBoxLayout* main_layout)
+{
+	title_bar_ = new QWidget(this);
+	title_bar_->setFixedHeight(28);
+	title_bar_->setStyleSheet(
+		"background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #000080, stop:1 #1084d0);");
+
+	title_bar_label_ = new QLabel(u8"XEMA 相机控制", title_bar_);
+	title_bar_label_->setStyleSheet(
+		"color: #ffffff; font-weight: bold; font-family: 'Tahoma','MS Sans Serif'; font-size: 9pt; background: transparent;");
+
+	auto makeCaptionButton = [this](const QString& marlettGlyph)
+	{
+		QPushButton* btn = new QPushButton(marlettGlyph, title_bar_);
+		btn->setFixedSize(18, 16);
+		btn->setStyleSheet(
+			"QPushButton { background-color: #c0c0c0; color: #000000; border-style: outset; border-width: 1px;"
+			"  border-color: #ffffff #808080 #808080 #ffffff; font-family: 'Marlett'; font-size: 9pt; padding: 0px; }"
+			"QPushButton:pressed { border-style: inset; border-color: #808080 #ffffff #ffffff #808080; }");
+		return btn;
+	};
+
+	btn_min_ = makeCaptionButton("0");   // Marlett '0' = minimize glyph
+	btn_max_ = makeCaptionButton("1");   // Marlett '1' = maximize glyph (becomes '2' -- restore -- once maximized)
+	btn_close_ = makeCaptionButton("r"); // Marlett 'r' = close (X) glyph
+
+	connect(btn_min_, &QPushButton::clicked, this, &QWidget::showMinimized);
+	connect(btn_max_, &QPushButton::clicked, this, [this]()
+	{
+		if (isMaximized())
+		{
+			showNormal();
+			btn_max_->setText("1");
+		}
+		else
+		{
+			showMaximized();
+			btn_max_->setText("2");
+		}
+	});
+	connect(btn_close_, &QPushButton::clicked, this, &QWidget::close);
+
+	QHBoxLayout* title_row = new QHBoxLayout(title_bar_);
+	title_row->setContentsMargins(6, 0, 4, 0);
+	title_row->setSpacing(2);
+	title_row->addWidget(title_bar_label_);
+	title_row->addStretch();
+	title_row->addWidget(btn_min_);
+	title_row->addWidget(btn_max_);
+	title_row->addWidget(btn_close_);
+
+	main_layout->addWidget(title_bar_);
+}
+
+// Click-drag anywhere on title_bar_ moves the window -- frameless windows lose the native
+// drag-by-caption behavior, so this replaces it manually. drag_offset_ is the mouse's position
+// relative to the window's own top-left, captured once at press time, so every subsequent
+// move() just re-anchors the window to (mouse global pos - that fixed offset) -- keeps the
+// window locked to the same point under the cursor instead of drifting.
+void XemaCameraWindow::mousePressEvent(QMouseEvent* event)
+{
+	if (event->button() == Qt::LeftButton && title_bar_ &&
+		title_bar_->geometry().contains(event->pos()))
+	{
+		dragging_ = true;
+		drag_offset_ = event->globalPos() - frameGeometry().topLeft();
+		event->accept();
+		return;
+	}
+	QWidget::mousePressEvent(event);
+}
+
+void XemaCameraWindow::mouseMoveEvent(QMouseEvent* event)
+{
+	if (dragging_ && (event->buttons() & Qt::LeftButton))
+	{
+		move(event->globalPos() - drag_offset_);
+		event->accept();
+		return;
+	}
+	QWidget::mouseMoveEvent(event);
+}
+
+void XemaCameraWindow::mouseReleaseEvent(QMouseEvent* event)
+{
+	dragging_ = false;
+	QWidget::mouseReleaseEvent(event);
+}
+
 QString XemaCameraWindow::levelTag(XemaLogLevel level)
 {
 	switch (level)
@@ -603,7 +723,8 @@ void XemaCameraWindow::connectThreadFunc(QString ip)
 	{
 		emit connectFinished(false,
 			QString(u8"连接失败(%1)").arg(ret),
-			QString("Connect failed: DfConnect returned error code %1").arg(ret));
+			QString("Connect failed: DfConnect returned error code %1").arg(ret),
+			QString());
 		return;
 	}
 
@@ -641,7 +762,8 @@ void XemaCameraWindow::connectThreadFunc(QString ip)
 	emit connectFinished(true,
 		QString(u8"已连接 %1x%2").arg(width_).arg(height_),
 		QString("Connected to %1 (%2x%3, firmware %4, projector %5)")
-			.arg(ip).arg(width_).arg(height_).arg(fw).arg(projector_version_));
+			.arg(ip).arg(width_).arg(height_).arg(fw).arg(projector_version_),
+		fw); 
 }
 
 void XemaCameraWindow::applyExposureRangeForProjector()
@@ -1080,17 +1202,18 @@ bool XemaCameraWindow::eventFilter(QObject* watched, QEvent* event)
 	return QWidget::eventFilter(watched, event);
 }
 
-void XemaCameraWindow::onConnectFinished(bool ok, QString guiMsg, QString consoleMsg)
+void XemaCameraWindow::onConnectFinished(bool ok, QString guiMsg, QString consoleMsg, QString firmwareVersion)
 {
-	busy_ = false;
 	log(ok ? XemaLogLevel::Success : XemaLogLevel::Error, guiMsg, consoleMsg);
 
 	if (ok)
 	{
+		firmware_version_ = firmwareVersion.isEmpty() ? u8"读取失败" : firmwareVersion;
+
 		setConnectedUiState(true);
 		applyExposureRangeForProjector();
 		label_image_->setText(u8"（已连接，尚未采集）");
-		label_firmware_->setText(u8"固件版本: 已连接");
+		label_firmware_->setText(QString(u8"固件版本: %1").arg(firmware_version_));
 		logCurrentParamsInto("post-connect");
 		saveConfig();
 	}
@@ -1155,6 +1278,7 @@ void XemaCameraWindow::onDisconnectFinished(QString guiMsg, QString consoleMsg, 
 {
 	setConnectedUiState(false);
 	btn_capture_->setText(u8"开始连续采集");
+	firmware_version_ = u8"-";
 	label_firmware_->setText(u8"固件版本: -");
 	label_image_->setText(u8"（未连接）");
 
@@ -1621,7 +1745,7 @@ void XemaCameraWindow::onCalibCaptureFinished(bool ok, QString guiMsg, QString c
 	setConnectedUiState(connected_);
 	if (connected_)
 	{
-		label_firmware_->setText(u8"固件版本: 已连接");
+		label_firmware_->setText(QString(u8"固件版本: %1").arg(firmware_version_));
 	}
 	btn_capture_->setText(capturing_ ? u8"停止采集" : u8"开始连续采集");
 }
@@ -1867,7 +1991,7 @@ void XemaCameraWindow::onWriteParamsFinished(QString guiMsg, QString consoleMsg,
 	setConnectedUiState(connected_);
 	if (connected_)
 	{
-		label_firmware_->setText(u8"固件版本: 已连接");
+		label_firmware_->setText(QString(u8"固件版本: %1").arg(firmware_version_));
 	}
 	btn_capture_->setText(capturing_ ? u8"停止采集" : u8"开始连续采集");
 }
