@@ -21,6 +21,7 @@
 #include <QListWidget>
 #include <QComboBox>
 #include <QTabWidget>
+#include <QJsonObject>
 #include <QSet>
 #include <QMouseEvent>
 #include <atomic>
@@ -408,6 +409,38 @@ private:
 	// on where poses and param.txt live without each recomputing it slightly differently.
 	QString currentIdentityFolder() const;
 
+public:
+	// ---- pure logic, pulled out of the thread functions/loadConfig specifically so it's
+	// unit-testable without a camera, an exe, or even a live XemaCameraWindow instance (Tier 1
+	// in xema_calib_tool_test_plan.md -- see tst_xema_calib_logic.cpp). Each of these is a
+	// static function of its inputs only, no side effects, so they're public rather than
+	// XEMA_TEST_HOOKS-gated -- there's nothing test-only or sensitive about exposing them. ----
+
+	// Builds calibration.exe's --calibrate argument list. Does NOT delete calib_out_path or
+	// run anything -- purely constructs the QStringList; calibrateThreadFunc handles the
+	// stale-file-delete-then-run-then-check-existence sequencing around this.
+	static QStringList buildCalibrateArgs(const QString& identity_folder, int projector_version,
+		int board_spacing_mm, XemaCalibMode calib_mode, const QString& calib_out_path);
+
+	// Builds calibration.exe's --correct argument list. Same non-side-effecting contract as
+	// buildCalibrateArgs above.
+	static QStringList buildCorrectArgs(const QString& identity_folder, int projector_version,
+		int board_spacing_mm, XemaCalibMode calib_mode, const QString& param_in_path,
+		const QString& param_out_path);
+
+	// Extracted from loadConfig's calib_mode handling: defaults to Color if the key is
+	// missing (config saved before this feature existed) or holds anything other than
+	// exactly "mono" (including garbage values) -- matches the previously-hardcoded
+	// "patterns-c" behavior in both cases.
+	static XemaCalibMode calibModeFromConfig(const QJsonObject& obj);
+
+	// Extracted from loadConfig's board_spacing_mm handling: defaults to Spacing80 for a
+	// missing key OR any value that isn't exactly one of the five valid spacings (including
+	// garbage values like 999) -- the switch's default: case already covered this before
+	// extraction, preserved here as-is.
+	static XemaBoardSpacingMm boardSpacingFromConfig(const QJsonObject& obj);
+private:
+
 	static const int kCaptureStopTimeoutMs = 8000; // how long applyParamsThreadFunc waits for an in-flight capture to finish before giving up and applying anyway
 
 	// UI
@@ -469,4 +502,29 @@ private:
 	int projector_version_ = 0;
 	QString firmware_version_ = u8"-"; // e.g. "v1.5.5", from DfGetFirmwareVersion at connect time -- reused verbatim on reconnects (calib capture / write params) so the badge never regresses to a placeholder
 	int pixel_type_ = 0; // 0=Mono, 1=BayerRG8 (XemaPixelType), from DfGetCameraPixelType -- diagnostic only, logged on connect
+
+#ifdef XEMA_TEST_HOOKS
+	// Test-only accessors for tst_xema_click_races.cpp. Guarded by XEMA_TEST_HOOKS, which the
+	// real xema_camera_gui target never defines -- these compile to nothing in that build.
+	// Only the test CMake target passes -DXEMA_TEST_HOOKS.
+public:
+	void testHook_setIp(const QString& ip) { edit_ip_->setText(ip); }
+	void testHook_setIdentity(const QString& id) { edit_identity_->setText(id); }
+	void testHook_setSavePath(const QString& p) { edit_save_path_->setText(p); }
+	// Raw override, NOT a real connect -- write-params requires connected_ before it'll even
+	// set its own guard flag, so cross-button tests need a way past that precondition without
+	// a real camera or a full SDK mock. Never toggles the actual connection.
+	void testHook_forceConnectedStateForTest(bool v) { connected_ = v; }
+	bool testHook_isCalibrating() const { return calibrating_; }
+	bool testHook_isCorrecting() const { return correcting_; }
+	bool testHook_isWritingParams() const { return writing_params_; }
+	bool testHook_isCalibCapturing() const { return calib_capturing_; }
+	bool testHook_isBusy() const { return busy_; }
+	// identityFolderName()/currentIdentityFolder() are pure/side-effect-free already but stay
+	// private (they read UI widgets, so exposing them broadly isn't worth it) -- thin
+	// pass-through wrappers for tst_xema_calib_logic.cpp instead.
+	QString testHook_identityFolderName() const { return identityFolderName(); }
+	QString testHook_currentIdentityFolder() const { return currentIdentityFolder(); }
+private:
+#endif
 };

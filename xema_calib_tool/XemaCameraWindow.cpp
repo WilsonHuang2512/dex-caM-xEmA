@@ -351,8 +351,19 @@ XemaCameraWindow::~XemaCameraWindow()
 	{
 		CloseHandle((HANDLE)console_handle_);
 		console_handle_ = nullptr;
+
+		// Only free the console if THIS instance was the one that allocated it (i.e.
+		// AllocConsole() succeeded in initStatusConsole(), which is exactly when
+		// console_handle_ gets set). Calling FreeConsole() unconditionally is wrong: if this
+		// process already had a console before XemaCameraWindow was ever constructed (e.g.
+		// running inside a console-subsystem test host, or in principle any process that
+		// inherited a console some other way), AllocConsole() fails, console_handle_ stays
+		// null, and an unconditional FreeConsole() here would detach the process from a
+		// console it never allocated -- severing stdout out from under whatever else is
+		// using it (this is exactly what silently killed tst_xema_click_races'/
+		// tst_window_construct's QTest output mid-run: not a crash, just detached stdout).
+		FreeConsole();
 	}
-	FreeConsole();
 #endif
 }
 
@@ -383,27 +394,24 @@ void XemaCameraWindow::loadConfig()
 	// session. A fresh connect below always overwrites this with the real detected value.
 	if (obj.contains("projector_version")) projector_version_ = obj.value("projector_version").toInt(0);
 
-	int spacing = obj.value("board_spacing_mm").toInt(80);
-	switch (spacing)
+	board_spacing_ = boardSpacingFromConfig(obj);
+	switch (board_spacing_)
 	{
-	case 4: radio_spacing_4_->setChecked(true); board_spacing_ = XemaBoardSpacingMm::Spacing4; break;
-	case 12: radio_spacing_12_->setChecked(true); board_spacing_ = XemaBoardSpacingMm::Spacing12; break;
-	case 20: radio_spacing_20_->setChecked(true); board_spacing_ = XemaBoardSpacingMm::Spacing20; break;
-	case 40: radio_spacing_40_->setChecked(true); board_spacing_ = XemaBoardSpacingMm::Spacing40; break;
-	default: radio_spacing_80_->setChecked(true); board_spacing_ = XemaBoardSpacingMm::Spacing80; break;
+	case XemaBoardSpacingMm::Spacing4: radio_spacing_4_->setChecked(true); break;
+	case XemaBoardSpacingMm::Spacing12: radio_spacing_12_->setChecked(true); break;
+	case XemaBoardSpacingMm::Spacing20: radio_spacing_20_->setChecked(true); break;
+	case XemaBoardSpacingMm::Spacing40: radio_spacing_40_->setChecked(true); break;
+	default: radio_spacing_80_->setChecked(true); break;
 	}
 
-	// Default "color" if never saved before -- matches the previously-hardcoded "patterns-c" behavior.
-	QString calib_mode_str = obj.value("calib_mode").toString("color");
-	if (calib_mode_str == "mono")
+	calib_mode_ = calibModeFromConfig(obj);
+	if (calib_mode_ == XemaCalibMode::Mono)
 	{
 		radio_calib_mono_->setChecked(true);
-		calib_mode_ = XemaCalibMode::Mono;
 	}
 	else
 	{
 		radio_calib_color_->setChecked(true);
-		calib_mode_ = XemaCalibMode::Color;
 	}
 }
 
@@ -1274,6 +1282,7 @@ bool XemaCameraWindow::eventFilter(QObject* watched, QEvent* event)
 
 void XemaCameraWindow::onConnectFinished(bool ok, QString guiMsg, QString consoleMsg, QString firmwareVersion)
 {
+	busy_ = false; // was never reset anywhere -- left the Connect button permanently locked out after the first attempt
 	log(ok ? XemaLogLevel::Success : XemaLogLevel::Error, guiMsg, consoleMsg);
 
 	if (ok)
@@ -1870,6 +1879,58 @@ void XemaCameraWindow::onCalibrateClicked()
 	t.detach();
 }
 
+// ==================== pure logic (Tier 1 unit-testable, see tst_xema_calib_logic.cpp) ====================
+
+QStringList XemaCameraWindow::buildCalibrateArgs(const QString& identity_folder, int projector_version,
+	int board_spacing_mm, XemaCalibMode calib_mode, const QString& calib_out_path)
+{
+	QString use_arg = (calib_mode == XemaCalibMode::Mono) ? "patterns" : "patterns-c";
+
+	QStringList args;
+	args << "--calibrate" << "--use" << use_arg
+		<< "--path" << QDir::toNativeSeparators(identity_folder + "/")
+		<< "--version" << QString::number(projector_version)
+		<< "--board" << QString::number(board_spacing_mm)
+		<< "--calib" << QDir::toNativeSeparators(calib_out_path);
+	return args;
+}
+
+QStringList XemaCameraWindow::buildCorrectArgs(const QString& identity_folder, int projector_version,
+	int board_spacing_mm, XemaCalibMode calib_mode, const QString& param_in_path,
+	const QString& param_out_path)
+{
+	QString use_arg = (calib_mode == XemaCalibMode::Mono) ? "patterns" : "patterns-c";
+
+	QStringList args;
+	args << "--correct" << "--use" << use_arg
+		<< "--path" << QDir::toNativeSeparators(identity_folder + "/")
+		<< "--version" << QString::number(projector_version)
+		<< "--board" << QString::number(board_spacing_mm)
+		<< "--param-in" << QDir::toNativeSeparators(param_in_path)
+		<< "--param-out" << QDir::toNativeSeparators(param_out_path);
+	return args;
+}
+
+XemaCalibMode XemaCameraWindow::calibModeFromConfig(const QJsonObject& obj)
+{
+	// Default "color" if never saved before -- matches the previously-hardcoded "patterns-c" behavior.
+	QString calib_mode_str = obj.value("calib_mode").toString("color");
+	return (calib_mode_str == "mono") ? XemaCalibMode::Mono : XemaCalibMode::Color;
+}
+
+XemaBoardSpacingMm XemaCameraWindow::boardSpacingFromConfig(const QJsonObject& obj)
+{
+	int spacing = obj.value("board_spacing_mm").toInt(80);
+	switch (spacing)
+	{
+	case 4: return XemaBoardSpacingMm::Spacing4;
+	case 12: return XemaBoardSpacingMm::Spacing12;
+	case 20: return XemaBoardSpacingMm::Spacing20;
+	case 40: return XemaBoardSpacingMm::Spacing40;
+	default: return XemaBoardSpacingMm::Spacing80;
+	}
+}
+
 void XemaCameraWindow::calibrateThreadFunc(QString identity_folder, int projector_version, int board_spacing_mm, XemaCalibMode calib_mode)
 {
 	// Matches main_xema_color.py's calibrate(), except --use is now picked from the UI
@@ -1887,14 +1948,7 @@ void XemaCameraWindow::calibrateThreadFunc(QString identity_folder, int projecto
 		QFile::remove(calib_path);
 	}
 
-	QString use_arg = (calib_mode == XemaCalibMode::Mono) ? "patterns" : "patterns-c";
-
-	QStringList args;
-	args << "--calibrate" << "--use" << use_arg
-		<< "--path" << QDir::toNativeSeparators(identity_folder + "/")
-		<< "--version" << QString::number(projector_version)
-		<< "--board" << QString::number(board_spacing_mm)
-		<< "--calib" << QDir::toNativeSeparators(calib_path);
+	QStringList args = buildCalibrateArgs(identity_folder, projector_version, board_spacing_mm, calib_mode, calib_path);
 
 	logConsoleOnly(XemaLogLevel::Exec, QString("[calib] running: calibration.exe %1").arg(args.join(' ')));
 
@@ -2274,15 +2328,7 @@ void XemaCameraWindow::correctThreadFunc(QString ip, QString identity_folder, in
 			QFile::remove(param_out_path);
 		}
 
-		QString use_arg = (calib_mode == XemaCalibMode::Mono) ? "patterns" : "patterns-c";
-
-		QStringList correct_args;
-		correct_args << "--correct" << "--use" << use_arg
-			<< "--path" << QDir::toNativeSeparators(identity_folder + "/")
-			<< "--version" << QString::number(projector_version)
-			<< "--board" << QString::number(board_spacing_mm)
-			<< "--param-in" << QDir::toNativeSeparators(param_in_path)
-			<< "--param-out" << QDir::toNativeSeparators(param_out_path);
+		QStringList correct_args = buildCorrectArgs(identity_folder, projector_version, board_spacing_mm, calib_mode, param_in_path, param_out_path);
 
 		logConsoleOnly(XemaLogLevel::Exec, QString("[correct] running: calibration.exe %1").arg(correct_args.join(' ')));
 
